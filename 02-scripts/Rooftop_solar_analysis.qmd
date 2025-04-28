@@ -1,0 +1,1664 @@
+---
+title: "Rooftop solar analysis"
+format: html
+editor: visual
+---
+
+## Initialise packages and inputs
+
+Packages
+
+```{r}
+#| message: false
+#| warning: false
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(lubridate)
+library(readxl)
+library(tibble)
+library(here)
+library(patchwork)
+```
+
+Input folder and helper function
+
+```{r}
+
+# Define input folder
+input_folder <- here("01-inputs")
+
+# Function to load data
+load_solar_data <- function(sheet_name, skip_rows = 0, col_types = NULL, range = NULL) {
+  file_path <- here(input_folder, "Rooftop_solar_calc_data.xlsx")
+  if (!file.exists(file_path)) {
+    stop(paste("File does not exist:", file_path))
+  }
+  read_excel(file_path, sheet = sheet_name, skip = skip_rows, col_types = col_types, range = range)
+}
+```
+
+## Historical bill savings from rooftop solar
+
+### Historical rooftop solar installation
+
+```{r}
+#| warning: false
+#| echo: false
+#| message: false
+
+# Import files
+caps <- c("2001-to-2010", "2011-to-present") %>%
+  set_names(c("cap_old","cap_new")) %>%
+  map(~ file.path(input_folder, paste0("sres-postcode-data-capacity-", .x, ".xlsx")))
+insts <- c("2001-to-2010", "2011-to-present") %>%
+  set_names(c("no_old","no_new")) %>%
+  map(~ file.path(input_folder, paste0("sres-postcode-data-installations-", .x, ".xlsx")))
+
+# Read & tidy one sheet
+read_pv <- function(path, skip) {
+  read_excel(path, sheet="SGU-Solar", skip=skip) %>%
+    rename(Postcode = 1) %>%
+    pivot_longer(-Postcode, names_to="Month", values_to="Value") %>%
+    mutate(
+      Month = dmy(str_c("1 ", str_extract(Month, "[A-Za-z]+ \\d{4}")))
+    )
+}
+
+pv_cap <- bind_rows(
+  read_pv(caps$cap_old, skip=2),
+  read_pv(caps$cap_new, skip=3)
+) %>% rename(Capacity_kW = Value)
+
+pv_no  <- bind_rows(
+  read_pv(insts$no_old, skip=2),
+  read_pv(insts$no_new, skip=3)
+) %>% rename(Number = Value)
+
+# Combine & calc average per install
+pv_pc <- inner_join(pv_cap, pv_no, by=c("Postcode","Month")) %>%
+  mutate(avg_cap = if_else(Number>0, Capacity_kW/Number, NA_real_))
+
+# Map postcode → state via base read.csv (postcode comes in numeric)
+states <- read.csv(
+  file.path(input_folder, "australian_postcodes.csv"),
+  stringsAsFactors = FALSE
+) %>%
+  as_tibble() %>%
+  group_by(postcode) %>%
+  summarise(state = first(state), .groups = "drop")
+
+pv_pc <- pv_pc %>%
+  inner_join(states, by = c("Postcode" = "postcode"))
+
+# State-level aggregation
+pv_st <- pv_pc %>%
+  group_by(state,Month) %>%
+  reframe(
+    Agg_capacity_kW    = sum(Capacity_kW, na.rm=TRUE),
+    Agg_number         = sum(Number,     na.rm=TRUE),
+    Avg_syst_size_kW   = if_else(Agg_number>0, Agg_capacity_kW/Agg_number, NA_real_),
+    Median_cap_postcode= median(avg_cap, na.rm=TRUE)
+  ) %>%
+  arrange(state, Month)
+
+# Trailing-12-month metrics
+pv_st <- pv_st %>%
+  group_by(state) %>%
+  mutate(
+    TTM_total_capacity_kW = rollapply(Agg_capacity_kW, 12, sum, align="right", fill=NA),
+    TTM_total_installs    = rollapply(Agg_number,      12, sum, align="right", fill=NA),
+    TTM_avg_syst_kW       = if_else(TTM_total_installs>0,
+                                     TTM_total_capacity_kW/TTM_total_installs,
+                                     NA_real_)
+  ) %>%
+  ungroup()
+
+# Plot NSW, QLD, SA & VIC with monthly & TTM lines, 3-unit y-axis breaks
+plot_states <- c("NSW","QLD","SA","VIC")
+pd <- pv_st %>% filter(state %in% plot_states)
+
+# x-axis ticks every 2 years, labels as two-digit years
+x_breaks <- seq(
+  floor_date(min(pd$Month),   "year"),
+  ceiling_date(max(pd$Month), "year"),
+  by = "2 years"
+)
+
+# determine y-axis top at next multiple of 3
+y_max   <- max(pd$TTM_avg_syst_kW, na.rm = TRUE)
+y_limit <- ceiling(y_max / 3) * 3
+
+ggplot(pd, aes(x = Month)) +
+  # Trailing 12-month average (black)
+  geom_line(aes(y = TTM_avg_syst_kW, colour = "Trailing annual average capacity"),
+            size = 1) +
+  # Monthly average (gray)
+  geom_line(aes(y = Avg_syst_size_kW, colour = "Monthly average capacity"),
+            size = 0.8, alpha = 0.8) +
+  facet_wrap(~ state, nrow = 1, scales = "fixed") +
+  scale_colour_manual(
+    values = c(
+      "Trailing annual average capacity" = "black",
+      "Monthly average capacity"        = "gray"
+    )
+  ) +
+  scale_x_date(breaks = x_breaks, date_labels = "%y") +
+  scale_y_continuous(
+    breaks = seq(0, y_limit, by = 3),
+    limits = c(0, y_limit),
+    expand = (c(0, 0))
+  ) +  # y-axis in 3-unit increments
+  labs(
+    title  = "Rooftop solar installation system size",
+    x      = "Year",
+    y      = "Average Capacity (kW)",
+    colour = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title           = element_text(hjust = 0.5, face = "bold"),
+    legend.position      = "top",
+    legend.justification = "center",
+    legend.direction     = "horizontal",
+    legend.margin        = margin(b = 5),
+    panel.grid.major.x   = element_blank(),
+    panel.grid.minor     = element_blank(),
+    axis.line            = element_line(color = "black"),
+    axis.ticks.length    = unit(-0.15, "cm"),   # inside ticks
+    axis.ticks           = element_line(color = "black"),
+    strip.background     = element_blank(),
+    strip.text           = element_text(face = "bold")
+  )
+```
+
+### Calculate rooftop PV capital cost, rebate, and installation cost
+
+The annual cost data (\`pv_cost\`) comes from the National Survey Report of PV Power Applications. The table column states “\\\$/kW” but in practice we interpret these values as “\\\$ per Watt.” We interpolate these annual values linearly to get a smoother monthly cost.
+
+```{r}
+
+# Prepare the main dataframe
+pv_state_df <- pv_state_aggregate %>%
+  mutate(Year = year(Month))
+
+# Load rooftop PV capital cost schedule
+pv_cost <- load_solar_data(sheet_name = "PV_cost", skip_rows = 2) %>% 
+  filter(!is.na(Year))
+
+year_min <- min(pv_cost$Year)
+year_max <- max(pv_cost$Year)
+
+# Generate monthly sequence for interpolation
+monthly_dates <- seq.Date(
+  from = as.Date(paste0(year_min, "-01-01")),
+  to = as.Date(paste0(year_max, "-12-01")),
+  by = "month"
+)
+
+# Interpolate PV costs monthly
+monthly_cost_df <- tibble(Month = monthly_dates) %>%
+  mutate(year_frac = year(Month) + (month(Month) - 1) / 12)
+approx_out <- approx(
+  x = pv_cost$Year,
+  y = pv_cost$Resi_PV_Cost_Watt,
+  xout = monthly_cost_df$year_frac,
+  method = "linear"
+)
+monthly_cost_df <- monthly_cost_df %>%
+  mutate(Resi_PV_Cost_Watt_Interp = approx_out$y) %>%
+  select(Month, Resi_PV_Cost_Watt_Interp)
+
+# Join costs and calculate capital cost with GST
+pv_state_df <- pv_state_df %>%
+  left_join(monthly_cost_df, by = "Month") %>%
+  mutate(Cap_cost = Resi_PV_Cost_Watt_Interp * TTM_avg_syst_kW * 1000 * 1.1)
+
+# Define rebate scheme timelines
+PVRP_start <- as.Date("2000-01-01")
+PVRP_mid <- as.Date("2000-10-01")
+PVRP_low <- as.Date("2003-05-01")
+PVRP_end <- as.Date("2007-05-31")
+SHCP_start <- as.Date("2007-06-01")
+SHCP_end <- as.Date("2009-06-30")
+
+# Add PVRP and SHCP rebates
+pv_state_df <- pv_state_df %>%
+  mutate(
+    PVRP_rebate = case_when(
+      Month >= PVRP_start & Month < PVRP_mid ~ pmin(TTM_avg_syst_kW * 5.5 * 1000, 8250),
+      Month >= PVRP_mid & Month < PVRP_low ~ pmin(TTM_avg_syst_kW * 5 * 1000, 7500),
+      Month >= PVRP_low & Month <= PVRP_end ~ pmin(TTM_avg_syst_kW * 4 * 1000, 4000),
+      Month >= SHCP_start & Month <= SHCP_end ~ pmin(TTM_avg_syst_kW * 8 * 1000, 8000),
+      TRUE ~ 0
+    )
+  )
+
+# Load PV zone ratings and STC prices
+pv_zone_rating <- load_solar_data(sheet_name = "PV_zone", skip_rows = 2) %>%
+  slice(1:(n() - 3)) %>%
+  select(Jurisdiction, `Assumed_Output_MWh/kW/a`)
+
+STC_prices <- load_solar_data(sheet_name = "STC", skip_rows = 2)
+max_deeming_years <- 15
+
+# Join zone ratings and STC prices
+pv_state_df <- pv_state_df %>%
+  left_join(pv_zone_rating, by = c("state" = "Jurisdiction")) %>%
+  left_join(STC_prices, by = "Year")
+
+# Calculate STC rebates
+pv_state_df <- pv_state_df %>%
+  mutate(
+    Deeming_years = pmin(2031 - pmax(year(Month), 2009), max_deeming_years),
+    STC_multiplier = case_when(
+      Month >= as.Date("2009-07-01") & Month <= as.Date("2011-06-30") ~ 5,
+      Month >= as.Date("2011-07-01") & Month <= as.Date("2012-06-30") ~ 3,
+      Month >= as.Date("2012-07-01") & Month <= as.Date("2012-12-31") ~ 2,
+      Month >= as.Date("2013-01-01") ~ 1,
+      TRUE ~ 0
+    ),
+    bonus_kW = pmin(TTM_avg_syst_kW, 1.5),
+    std_kW = pmax(TTM_avg_syst_kW - 1.5, 0),
+    stc_bonus_count = bonus_kW * `Assumed_Output_MWh/kW/a` * Deeming_years * STC_multiplier,
+    stc_std_count = std_kW * `Assumed_Output_MWh/kW/a` * Deeming_years * if_else(STC_multiplier > 0, 1, 0),
+    stc_unadjusted = stc_bonus_count + stc_std_count,
+    STC_no = if_else(Month <= SHCP_end, 0, floor(stc_unadjusted)),
+    STC_rebate = STC_no * W_avg_price
+  ) %>%
+  mutate(
+    PVRP_rebate = replace_na(PVRP_rebate, 0),
+    STC_rebate = replace_na(STC_rebate, 0),
+    Installation_cost = Cap_cost - PVRP_rebate - STC_rebate
+  )
+
+# First Plot: Installation Cost and TTM Avg System Size Over Time in NSW
+plot1 <- ggplot(
+  pv_state_df %>% filter(Month >= as.Date("2000-01-01"), state == "NSW"),
+  aes(x = Month)
+) +
+  geom_area(aes(y = TTM_avg_syst_kW * 2000, fill = "TTM Avg System Size (kW)"), alpha = 0.5) +
+  geom_line(aes(y = Installation_cost, color = "Installation Cost ($)"), size = 1) +
+  labs(
+    title = "Installation Cost and TTM Avg System Size Over Time in NSW",
+    x = NULL,
+    y = "Installation Cost ($)",
+    color = NULL,
+    fill = NULL
+  ) +
+  scale_y_continuous(
+    name = "Installation Cost ($)",
+    labels = scales::comma,
+    expand = c(0, 0),
+    sec.axis = sec_axis(~ . / 2000, name = "TTM Avg System Size (kW)")
+  ) +
+  scale_x_date(date_labels = "'%y", date_breaks = "2 years", expand = c(0,0)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 1),
+    axis.text.y = element_text(color = "blue"),
+    axis.text.y.right = element_text(color = "black"),
+    axis.title.y = element_text(color = "blue"),
+    axis.title.y.right = element_text(color = "black"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "top"
+  ) +
+  scale_color_manual(values = c("Installation Cost ($)" = "blue")) +
+  scale_fill_manual(values = c("TTM Avg System Size (kW)" = "gray"))
+
+# Second Plot: Typical Installation Cost and System Size in NSW
+plot2 <- ggplot(annual_avg_data, aes(x = Year)) +
+  geom_col(aes(y = Avg_TTM_System_Size * 2500, fill = "Annual Average System Size (kW)"), alpha = 0.5) +
+  geom_line(aes(y = Avg_Installation_Cost, color = "Installation Cost ($)"), size = 1) +
+  labs(
+    title = "Typical Installation Cost and System Size in NSW",
+    x = NULL,
+    y = "Installation Cost ($)",
+    color = NULL,
+    fill = NULL
+  ) +
+  scale_y_continuous(
+    name = "Installation Cost ($)",
+    labels = scales::comma,
+    breaks = seq(0, 25000, by = 5000),
+    expand = c(0, 0),
+    sec.axis = sec_axis(
+      transform = ~ . / 2500,
+      name = "Annual Average System Size (kW)",
+      breaks = seq(0, 10, by = 2)
+    )
+  ) +
+  scale_x_continuous(
+    breaks = seq(min(annual_avg_data$Year), max(annual_avg_data$Year), by = 2),
+    labels = function(x) paste0("'", sprintf("%02d", x %% 100)),
+    expand = c(0, 0)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, margin = margin(t = 5)),
+    axis.text.y = element_text(color = "blue"),
+    axis.text.y.right = element_text(color = "black"),
+    axis.title.y = element_text(color = "blue", margin = margin(r = 20, l = 20)),
+    axis.title.y.right = element_text(color = "black", margin = margin(l = 20, r = 20)),
+    axis.line = element_line(color = "black"),
+    plot.title = element_text(hjust = 0.5, size = 14, margin = margin(b = 20, t = 5)),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    text = element_text(size = 14)
+  ) +
+  scale_color_manual(values = c("Installation Cost ($)" = "blue")) +
+  scale_fill_manual(values = c("Annual Average System Size (kW)" = "gray"))
+
+# Display plots
+print(plot1)
+print(plot2)
+```
+
+### Rebate & out-of-pocket expense for 1.5 kW system
+
+```{r}
+
+# Define system size to model
+pv_system_size <- 1.5 # kW system size
+
+# Define rebate scheme timelines (required for get_total_rebate_3kw)
+PVRP_start <- as.Date("2000-01-01")
+PVRP_mid <- as.Date("2000-10-01")
+PVRP_low <- as.Date("2003-05-01")
+PVRP_end <- as.Date("2007-05-31")
+SHCP_start <- as.Date("2007-06-01")
+SHCP_end <- as.Date("2009-06-30")
+
+# Filter June from 2000–2024 in monthly_cost_df (EOFY)
+annual_kw_cost_df <- monthly_cost_df %>%
+  filter(month(Month) == 6,
+         year(Month) >= 2000,
+         year(Month) <= 2024) %>%
+  mutate(Year = year(Month)) %>%
+  select(Year, Month, Resi_PV_Cost_Watt_Interp)
+
+# Join the STC_prices to get W_avg_price by Year
+annual_kw_cost_df <- annual_kw_cost_df %>%
+  left_join(STC_prices, by = "Year")
+
+# Function to calculate total rebates for a parameterised system size
+get_total_rebate_3kw <- function(install_date, stc_price) {
+  # PVRP/SHCP portion
+  pvrp_shcp <- case_when(
+    install_date >= PVRP_start & install_date < PVRP_mid ~ pmin(pv_system_size * 1000 * 5.5, 8250),
+    install_date >= PVRP_mid   & install_date < PVRP_low ~ pmin(pv_system_size * 1000 * 5.0, 7500),
+    install_date >= PVRP_low   & install_date <= PVRP_end ~ pmin(pv_system_size * 1000 * 4.0, 4000),
+    install_date >= SHCP_start & install_date <= SHCP_end ~ pmin(pv_system_size * 1000 * 8.0, 8000),
+    TRUE ~ 0
+  )
+  
+  # STC portion
+  if (install_date <= SHCP_end) {
+    stc_rebate <- 0
+  } else {
+    # Solar Credits multiplier
+    stc_multiplier <- case_when(
+      install_date >= as.Date("2009-07-01") & install_date <= as.Date("2011-06-30") ~ 5,
+      install_date >= as.Date("2011-07-01") & install_date <= as.Date("2012-06-30") ~ 3,
+      install_date >= as.Date("2012-07-01") & install_date <= as.Date("2012-12-31") ~ 2,
+      install_date >= as.Date("2013-01-01") ~ 1,
+      TRUE ~ 0
+    )
+    
+    # Deeming years up to 15 or until 2030
+    deeming_yrs <- min(2030 - lubridate::year(install_date), 15)
+    deeming_yrs <- ifelse(deeming_yrs < 0, 0, deeming_yrs)
+    
+    # Partial multiplier on first 1.5 kW
+    bonus_kw <- pmin(pv_system_size, 1.5)
+    std_kw   <- pmax(pv_system_size - 1.5, 0)
+    
+    # Approx annual output (assumed 1.38 MWh/kW typical)
+    annual_output_mwh_kw <- 1.38
+    
+    # Calculate STCs
+    stc_bonus    <- bonus_kw * annual_output_mwh_kw * deeming_yrs * stc_multiplier
+    stc_standard <- std_kw   * annual_output_mwh_kw * deeming_yrs * ifelse(stc_multiplier > 0, 1, 0)
+    
+    stc_no     <- floor(stc_bonus + stc_standard)
+    stc_rebate <- stc_no * stc_price
+  }
+  
+  return(pvrp_shcp + stc_rebate)
+}
+
+# Build a final summary data frame
+three_kw_rebate_df <- annual_kw_cost_df %>%
+  rowwise() %>%
+  mutate(
+    # Pre-rebate cost for the selected system size
+    PreRebate_Cost = Resi_PV_Cost_Watt_Interp * (pv_system_size * 1000) * 1.1,
+    
+    # Total rebates using the dynamic STC price
+    Total_Rebates  = get_total_rebate_3kw(Month, W_avg_price),
+    
+    # Out-of-pocket expense
+    OutOfPocket    = PreRebate_Cost - Total_Rebates,
+    
+    # Rebate as percentage of installation cost
+    RebatePct = Total_Rebates / PreRebate_Cost,
+    
+    # Out of Pocket as percentage of installation cost
+    OutofPocketPct = 1 - RebatePct
+  ) %>%
+  ungroup()
+
+# Construct three_kw_long_rebate for the stacked bar plot (percentages)
+three_kw_long_rebate <- three_kw_rebate_df %>%
+  select(Year, RebatePct, OutofPocketPct) %>%
+  pivot_longer(cols = c(RebatePct, OutofPocketPct),
+               names_to = "CostComponent",
+               values_to = "Value") %>%
+  mutate(CostComponent = recode(CostComponent,
+                                "RebatePct" = "Rebates",
+                                "OutofPocketPct" = "Household Out-of-Pocket"),
+         CostComponent = factor(CostComponent, levels = c("Rebates", "Household Out-of-Pocket")))
+
+# Define a scale factor for the secondary y-axis
+household_cost_scale <- 20000  # Maximum household cost in $AUD
+
+# Create the plot
+ggplot(three_kw_long_rebate, aes(x = factor(Year), y = Value, fill = CostComponent)) +
+  geom_col(position = "stack") +  # Stacked bars
+  geom_line(data = three_kw_rebate_df, 
+            aes(x = factor(Year), y = OutOfPocket / household_cost_scale, group = 1, color = "Household Out-of-Pocket ($)"), 
+            size = 1, inherit.aes = FALSE) +
+  geom_point(data = three_kw_rebate_df, 
+             aes(x = factor(Year), y = OutOfPocket / household_cost_scale, color = "Household Out-of-Pocket ($)"), 
+             size = 2, inherit.aes = FALSE) +
+  scale_y_continuous(
+    name = "Percentage of System Cost",
+    limits = c(0, 1),  # 0% to 100%
+    breaks = seq(0, 1, by = 0.25),  # 25% increments
+    labels = scales::percent, 
+    expand = c(0, 0),
+    sec.axis = sec_axis(
+      trans = ~ . * household_cost_scale, 
+      name = "Household Out-of-Pocket Cost",
+      breaks = seq(0, 20000, by = 5000),  # $5,000 increments
+      labels = function(x) paste0("$", scales::comma(x))  # Add $ symbol and comma formatting
+    )
+  ) +
+  scale_x_discrete(
+    labels = function(x) paste0("'", sprintf("%02d", as.numeric(x) %% 100))
+  ) +
+  labs(
+    title = "Solar System Costs Covered by Rebates vs. Household",
+    subtitle = "For a 1.5kW system",
+    x = "Installation Year",
+    fill = NULL,
+    color = NULL  # For the line legend
+  ) +
+  scale_fill_manual(
+    values = c("Rebates" = "#00897B", "Household Out-of-Pocket" = "#FF6F61"),
+    labels = c("Rebates (%)", "Household Out-of-Pocket (%)")  # Updated legend labels for fill
+  ) +
+  scale_color_manual(
+    values = c("Household Out-of-Pocket ($)" = "gray20"),
+    labels = c("Household Out-of-Pocket ($)")  # Updated legend labels for line
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.55, size = 10, colour = "black"),
+    axis.text.y = element_text(size = 11, colour = "black"),
+    axis.text.y.right = element_text(size = 11, colour = "black"),
+    axis.title.x = element_text(hjust = 0.5, size = 14, colour = "black", margin = margin(t = 10)),
+    axis.title.y = element_text(angle = 90, hjust = 0.5, size = 14, colour = "black", margin = margin(r = 10)),
+    axis.title.y.right = element_text(angle = 270, hjust = 0.5, size = 14, colour = "gray30", margin = margin(l = 10)),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = "black"),
+    panel.border = element_blank(),
+    axis.ticks.y = element_line(colour = "gray30"),
+    axis.ticks.y.right = element_line(colour = "gray30"),
+    axis.ticks.length.y = unit(0.15, "cm"),
+    axis.ticks.length.y.right = unit(0.15, "cm"),
+    plot.title = element_text(hjust = 0, size = 15, margin = margin(b = 15, t = 15)), 
+    legend.text = element_text(size = 11),
+    legend.position = "top"  # Position the legend at the top
+  )
+```
+
+### Solar production and export
+
+Note: Does not account for degradation. GEM, for e.g., applies an annual degradation factor of 99.3%.
+
+```{r}
+#| warning: false
+#| message: false
+
+# Key assumptions for solar production 
+hours_mth <- 365.25 * 24 / 12 #number of hours in a month, accounting for leap years 
+
+pv_zone_rating <- pv_zone_rating %>% # Capacity factor
+  mutate(
+    Capacity_Factor = (`Assumed_Output_MWh/kW/a` * 10^3) / (365 * 24)
+  )
+
+# Key assumptions and inputs for solar export 
+
+pv_export <- load_solar_data(sheet_name = "Export", skip_rows = 2) %>%  # Export ratio by system size
+  select(1:2) %>% 
+  slice(1:9) %>% 
+  mutate(Export = as.numeric(`SunWiz Export Ratios`),
+         `System size` = as.numeric(`System size`))
+
+pv_export_param <- load_solar_data(sheet_name = "Export", range = "B35:C36") # Import parameters to estimate solar export for various system sizes
+Export_a <- pv_export_param[[1]]  # Value in B37
+Export_k <- pv_export_param[[2]]  # Value in C37
+
+
+# Function to select or calculate export ratio for system sizes not specified in pv_export
+calculate_export_ratio <- function(system_size) {
+  # Check if system size matches one of the system sizes in pv_export
+  if(system_size %in% pv_export$`System size`) {
+    # If match found, return corresponding export ratio
+    export_ratio <- pv_export %>% 
+      filter(`System size` == system_size) %>% 
+      pull(Export)
+    return(export_ratio)
+  } else {
+    # If no match, calculate using the following formula
+    pv_export_ratio <- Export_a * (1 - exp(-Export_k * system_size))
+    return(pv_export_ratio)
+  }
+} 
+
+# Join capacity factors to pv_state_df
+pv_state_df <- pv_state_df %>%
+  left_join(
+    pv_zone_rating %>% select(Jurisdiction, Capacity_Factor),
+    by = c("state" = "Jurisdiction")
+  ) 
+
+# Calculate monthly production and export
+pv_state_df <- pv_state_df %>%
+  rowwise() %>% 
+  mutate(
+    Monthly_prod_kWh = TTM_avg_syst_kW * hours_mth * Capacity_Factor,
+    Export_ratio = calculate_export_ratio(TTM_avg_syst_kW),
+    Monthly_export_kWh = Monthly_prod_kWh * Export_ratio,
+    Monthly_self_consmp_kWh = Monthly_prod_kWh - Monthly_export_kWh
+  ) %>% 
+  ungroup()
+
+# Plot NSW, SA and VIC PV production
+pv_state_df_filtered <- pv_state_df %>%
+  filter(state %in% c("NSW", "SA", "VIC"))
+
+# Create the plot
+ggplot(pv_state_df_filtered, aes(x = Month, y = Monthly_prod_kWh)) +
+  geom_line(color = "blue", size = 0.8) +  # Line plot
+  facet_wrap(~ state, scales = "fixed") +  # Fixed y-axis scale
+  labs(
+    title = "Avg Monthly Solar Production for Installed Systems",
+    x = "Month",
+    y = "Monthly Production (kWh)"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),  # Style facet labels
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels
+    plot.title = element_text(hjust = 0.5)  # Center the title
+  )
+
+# Plot self-consumption and export 
+
+# Filter for relevant data and reshape to long format
+states_to_plot <- c("NSW", "SA", "VIC")
+
+long_data <- pv_state_df_filtered %>%
+  filter(state %in% states_to_plot) %>%
+  pivot_longer(
+    cols = c(Monthly_self_consmp_kWh, Monthly_export_kWh),
+    names_to = "Category",
+    values_to = "kWh"
+  ) %>%
+  mutate(
+    # Adjust category names for labels
+    Category = factor(Category, levels = c("Monthly_self_consmp_kWh", "Monthly_export_kWh"),
+                      labels = c("Self-consumption", "Export"))
+  )
+
+# Create the stacked column plot
+ggplot(long_data, aes(x = Month, y = kWh, fill = Category)) +
+  geom_col(position = "stack") +  # Stacked columns
+  facet_wrap(~ state, scales = "fixed") +  # Facet by state
+  scale_fill_manual(
+    values = c("Self-consumption" = "skyblue", "Export" = "orange")
+  ) +
+  labs(
+    title = "Monthly Self-Consumption and Export by State",
+    x = "Month",
+    y = "Energy (kWh)",
+    fill = "Category"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),  # Style facet labels
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels
+    plot.title = element_text(hjust = 0.5)  # Center the title
+  )
+
+
+# Plot system size vs monthly export by state
+ggplot(pv_state_df, aes(x = TTM_avg_syst_kW, y = Monthly_export_kWh)) +
+  geom_point(alpha = 0.6, color = "blue") +  # Scatter points
+  #geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add a trendline
+  facet_wrap(~ state, scales = "fixed") +  # Facet by state
+  labs(
+    title = "System Size vs. Monthly Export Energy by State",
+    x = "Average System Size (kW)",
+    y = "Monthly Export (kWh)"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),  # Style facet labels
+    plot.title = element_text(hjust = 0.5),  # Center the title
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12)
+  )
+
+```
+
+### Solar savings
+
+Prepare FiT and usage rates data
+
+```{r}
+
+# Import FiT rates and usage rates
+FiT_data <- load_solar_data(sheet_name = "FiT", skip_rows = 2) %>% 
+  mutate(FiT_Start = as.Date(FiT_Start),
+         FiT_End = as.Date(FiT_End),
+         `Rate_c/kW` = as.numeric(`Rate_c/kW`))
+
+FiT_lock_in <- load_solar_data("FiT-lock-in", 2) %>% 
+  mutate(FiT_Open = as.Date(FiT_Open),
+         FiT_Close = as.Date(FiT_Close),
+         `Rate_c/kW` = as.numeric(`Rate_c/kW`))
+
+retail_prices <- load_solar_data("REP", 2) %>%
+  group_by(State, Year) %>%
+  summarise(Usage_rate = mean(Usage_rate, na.rm = TRUE), .groups = 'drop')
+
+# Identify the last install month and define analysis horizon
+last_install_month <- max(pv_state_df$Month, na.rm = TRUE)
+analysis_end_month <- as.Date("2060-12-01")
+
+# Expand each row into all production months from install to end of analysis
+expanded_savings_df <- pv_state_df %>%
+  rename(InstallMonth = Month) %>%
+  mutate(ProductionSeq = map(InstallMonth, ~ seq.Date(from = .x, to = analysis_end_month, by = "month"))) %>%
+  unnest(cols = ProductionSeq) %>%
+  rename(ProductionMonth = ProductionSeq)
+
+```
+
+Plot FiT rates - NSW
+
+```{r}
+# PLOT: Feed-in tariff rates in NSW
+fit_data_nsw <- FiT_data %>%
+  filter(State == "NSW", FiT_End <= as.Date("2025-06-30"))
+
+fit_lockin_nsw <- FiT_lock_in %>%
+  filter(State == "NSW")
+
+fit_data_plot <- fit_data_nsw %>%
+  select(Start = FiT_Start, End = FiT_End, Rate = `Rate_c/kW`) %>%
+  mutate(Category = "Normal feed-in tariff")
+
+fit_lockin_60 <- fit_lockin_nsw %>%
+  filter(`Rate_c/kW` == 60) %>%
+  select(Start = FiT_Open, End = Last_payment, Rate = `Rate_c/kW`) %>%
+  mutate(Start = as.Date(Start), End = as.Date(End), Category = "Solar Bonus Scheme 60c/kWh")
+
+fit_lockin_20 <- fit_lockin_nsw %>%
+  filter(`Rate_c/kW` == 20) %>%
+  select(Start = FiT_Open, End = Last_payment, Rate = `Rate_c/kW`) %>%
+  mutate(Start = as.Date(Start), End = as.Date(End), Category = "Solar Bonus Scheme 20c/kWh")
+
+segments <- bind_rows(fit_data_plot, fit_lockin_60, fit_lockin_20)
+
+fit_data_steps_long <- segments %>%
+  filter(Category == "Normal feed-in tariff") %>%
+  pivot_longer(cols = c(Start, End), names_to = "Time_Type", values_to = "Date") %>%
+  arrange(Date) %>%
+  select(Date, Rate) %>%
+  distinct()
+
+lock_in_plot <- segments %>%
+  filter(Category != "Normal feed-in tariff")
+
+# Prepare labels for direct plotting
+normal_label <- fit_data_steps_long %>% 
+  arrange(desc(Date)) %>% 
+  slice(1) %>% 
+  select(x = Date, y = Rate) %>% 
+  mutate(y = 12,  # Move label to y = 12 as requested
+         label = "Normal Feed-in Tariff", 
+         Category = "Normal feed-in tariff")
+
+scheme_60_label <- lock_in_plot %>% 
+  filter(Category == "Solar Bonus Scheme 60c/kWh") %>% 
+  mutate(x = Start + (End - Start) / 2, 
+         y = Rate + 3, 
+         label = "Solar Bonus Scheme (60c/kWh)", 
+         Category = "Solar Bonus Scheme 60c/kWh")
+
+scheme_20_label <- lock_in_plot %>% 
+  filter(Category == "Solar Bonus Scheme 20c/kWh") %>% 
+  mutate(x = Start + (End - Start) / 2, 
+         y = Rate + 3, 
+         label = "Solar Bonus Scheme (20c/kWh)", 
+         Category = "Solar Bonus Scheme 20c/kWh")
+
+labels_df <- bind_rows(normal_label, scheme_60_label, scheme_20_label)
+
+# Create and display the plot
+ggplot() +
+  geom_step(data = fit_data_steps_long, aes(x = Date, y = Rate, color = "Normal feed-in tariff"), direction = "hv", size = 1.2) +
+  geom_segment(data = lock_in_plot %>% filter(Category == "Solar Bonus Scheme 60c/kWh"), aes(x = Start, xend = End, y = Rate, yend = Rate, color = "Solar Bonus Scheme 60c/kWh"), size = 1.2) +
+  geom_segment(data = lock_in_plot %>% filter(Category == "Solar Bonus Scheme 20c/kWh"), aes(x = Start, xend = End, y = Rate, yend = Rate, color = "Solar Bonus Scheme 20c/kWh"), size = 1.2) +
+  geom_text(data = labels_df, aes(x = x, y = y, label = label, color = Category), size = 4) +
+  scale_color_manual(values = c("Normal feed-in tariff" = "blue", "Solar Bonus Scheme 60c/kWh" = "red", "Solar Bonus Scheme 20c/kWh" = "orange")) +
+  scale_x_date(limits = as.Date(c("2008-01-01", "2026-12-31")), date_breaks = "2 years", date_labels = "%Y") +
+  scale_y_continuous(limits = c(0, 70), breaks = seq(0, 70, 10)) +
+  labs(x = NULL, y = "Rate (c/kWh)", title = "Feed-in Tariff Rates in NSW") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 12),
+    legend.position = "none",  # Remove legend
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    axis.line = element_line(color = "black"),  # Black axis lines for x and y
+    axis.ticks = element_line(color = "black"),  # Black ticks
+    axis.ticks.length = unit(-0.25, "cm"),  # Inward ticks (negative length)
+    axis.text.x = element_text(margin = margin(t = 10)),  # Space for inward ticks
+    axis.text.y = element_text(margin = margin(r = 10))   # Space for inward ticks
+  )
+```
+
+Usage and FiT rates processing
+
+```{r}
+# Usage rates
+get_financial_year <- function(date) {
+  fy_year <- year(date)
+  if (month(date) >= 7) fy_year <- fy_year + 1
+  fy_year
+}
+
+max_usage_year <- max(retail_prices$Year, na.rm = TRUE)
+projected_usage <- retail_prices %>%
+  group_by(State) %>%
+  filter(Year == max(Year, na.rm = TRUE)) %>%
+  mutate(Year = list((max_usage_year + 1):2060)) %>%
+  unnest(cols = Year) %>%
+  ungroup()
+
+retail_prices <- bind_rows(retail_prices, projected_usage)
+
+all_months <- seq.Date(from = as.Date("2000-01-01"), to = as.Date("2060-12-01"), by = "month")
+usage_monthly <- expand.grid(State = unique(retail_prices$State), Month = all_months) %>%
+  mutate(FinYear = map_int(Month, get_financial_year)) %>%
+  left_join(retail_prices, by = c("State", "FinYear" = "Year")) %>%
+  mutate(Usage_rate = Usage_rate / 100) %>%
+  rename(ProductionMonth = Month)
+
+expanded_savings_df <- expanded_savings_df %>%
+  left_join(usage_monthly, by = c("state" = "State", "ProductionMonth")) %>%
+  filter(state == "NSW")
+
+# FiT Rates
+max_fit_date <- max(FiT_data$FiT_End, na.rm = TRUE)
+projected_fit <- FiT_data %>%
+  group_by(State) %>%
+  filter(FiT_End == max(FiT_End, na.rm = TRUE)) %>%
+  mutate(FiT_Start = max_fit_date + 1, FiT_End = as.Date("2060-12-31")) %>%
+  ungroup()
+
+FiT_data <- bind_rows(FiT_data, projected_fit)
+```
+
+Apply relevant FiT rate to each installation and production month accounting for lock-in schemes or standard rates
+
+```{r}
+get_fit_rate <- function(state, install_month, export_month) {
+  lock_in <- FiT_lock_in %>%
+    filter(State == state, FiT_Open <= install_month, FiT_Close >= install_month)
+  if (nrow(lock_in) > 0) {
+    locked_rate <- lock_in$`Rate_c/kW`[1] / 100
+    last_payment <- as.Date(lock_in$Last_payment[1])
+    fit_type <- lock_in$Type[1]
+    if (export_month <= last_payment) return(list(rate = locked_rate, type = fit_type, last_payment = last_payment))
+  }
+  fit_data <- FiT_data %>%
+    filter(State == state, FiT_Start <= export_month, FiT_End >= export_month)
+  if (nrow(fit_data) > 0) {
+    fit_rate <- fit_data$`Rate_c/kW`[1] / 100
+    fit_type <- ifelse(is.na(fit_data$Type[1]), "Net", fit_data$Type[1])
+    return(list(rate = fit_rate, type = fit_type, last_payment = NA))
+  }
+  return(list(rate = 0, type = "Net", last_payment = NA))
+}
+
+expanded_savings_df <- expanded_savings_df %>%
+  rowwise() %>%
+  mutate(
+    fit_info = list(get_fit_rate(state, InstallMonth, ProductionMonth)),
+    FiT_rate = fit_info$rate,
+    FiT_type = fit_info$type
+  ) %>%
+  ungroup()
+
+```
+
+Savings calculation
+
+```{r}
+expanded_savings_df <- expanded_savings_df %>%
+  mutate(
+    Consmp_savings = Monthly_self_consmp_kWh * Usage_rate,
+    FiT_revenue = case_when(
+      FiT_type == "Gross" ~ Monthly_prod_kWh * FiT_rate,
+      TRUE ~ Monthly_export_kWh * FiT_rate
+    ),
+    Total_savings = Consmp_savings + FiT_revenue
+  )
+
+# Optional: quick check
+head(expanded_savings_df)
+```
+
+### Payback, ROI, IRR metrics
+
+```{r}
+
+# Calculate payback_df
+payback_df <- expanded_savings_df %>%
+  group_by(state, InstallMonth) %>%
+  arrange(ProductionMonth) %>%
+  mutate(
+    cum_savings = cumsum(Total_savings),
+    payback_bool = cum_savings >= Installation_cost
+  ) %>%
+  summarise(
+    Year = first(Year),
+    analysis_payback_month_index = match(TRUE, payback_bool),
+    analysis_payback_month = if_else(
+      is.na(analysis_payback_month_index), 
+      NA_Date_, 
+      ProductionMonth[analysis_payback_month_index]
+    ),
+    Installation_cost = first(Installation_cost),
+    monthly_installations = first(Agg_number),
+    latest_month_savings = last(Total_savings),
+    cum_savings_end = last(cum_savings),
+    analysis_months_transpired = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    analysis_payback_months = if_else(
+      !is.na(analysis_payback_month),
+      analysis_payback_month_index,
+      NA_real_
+    ),
+    residual_months = if_else(
+      is.na(analysis_payback_month),
+      (Installation_cost - cum_savings_end) / latest_month_savings,
+      NA_real_
+    ),
+    total_payback_months = if_else(
+      !is.na(analysis_payback_months),
+      analysis_payback_months,
+      analysis_months_transpired + residual_months
+    ),
+    total_payback_years = total_payback_months / 12
+  )
+
+# Aggregate payback_df to quarterly level
+payback_df_quarterly <- payback_df %>%
+  mutate(Quarter = paste0(Year, "-Q", quarter(InstallMonth))) %>%
+  group_by(state, Quarter) %>%
+  summarise(
+    payback_years = mean(total_payback_years, na.rm = TRUE),
+    quarterly_installations = sum(monthly_installations, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Quarter_Start = as.Date(paste0(sub("-Q1", "-01-01", 
+                                       sub("-Q2", "-04-01", 
+                                           sub("-Q3", "-07-01", 
+                                               sub("-Q4", "-10-01", Quarter))))), "%Y-%m-%d")
+  )
+
+# Calculate norm_25yr_df
+norm_25yr_df <- expanded_savings_df %>%
+  filter(ProductionMonth <= InstallMonth + months(299)) %>%
+  group_by(state, InstallMonth) %>%
+  summarise(
+    savings_25_years = sum(Total_savings, na.rm = TRUE),
+    n_months_25_years = n_distinct(ProductionMonth),
+    install_cost = first(Installation_cost),
+    Monthly_installs = first(Agg_number),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    net_savings_25yr = savings_25_years - install_cost,
+    net_roi_pct = net_savings_25yr / install_cost
+  )
+
+# Aggregate norm_25yr_df to quarterly level
+norm_25yr_quarterly_df <- norm_25yr_df %>%
+  mutate(InstallQuarter = floor_date(InstallMonth, "quarter")) %>%
+  group_by(state, InstallQuarter) %>%
+  summarise(
+    net_roi_pct = mean(net_roi_pct, na.rm = TRUE),
+    Quarterly_installs = sum(Monthly_installs, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Calculate cf_irr_df
+cf_irr_df <- expanded_savings_df %>%
+  filter(ProductionMonth <= InstallMonth + months(299)) %>%
+  group_by(state, InstallMonth) %>%
+  reframe(
+    install_cost = first(Installation_cost),
+    cashflows = list(c(-first(Installation_cost) + first(Total_savings), Total_savings[-1])),
+    InstallCount = first(Agg_number)
+  ) %>%
+  mutate(
+    Monthly_IRR = map_dbl(cashflows, ~ irr(.x)),
+    Annual_IRR = (1 + Monthly_IRR) ^ 12 - 1
+  ) %>%
+  select(state, InstallMonth, Annual_IRR, InstallCount)
+
+# Aggregate cf_irr_df to quarterly level
+cf_irr_quarterly_df <- cf_irr_df %>%
+  mutate(InstallQuarter = floor_date(InstallMonth, "quarter")) %>%
+  group_by(state, InstallQuarter) %>%
+  summarise(
+    Annual_IRR = mean(Annual_IRR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(norm_25yr_quarterly_df %>% select(state, InstallQuarter, Quarterly_installs), 
+            by = c("state", "InstallQuarter"))
+
+# Define scaling factors
+install_to_IRR_scale <- 0.5 / 50000
+net_savings_to_installations_scale <- 40000 / 400
+payback_to_installations_scale <- 40000 / 60
+
+# Create payback_plot
+payback_plot <- ggplot(payback_df_quarterly, aes(x = Quarter_Start)) +
+  geom_bar(
+    aes(y = quarterly_installations / payback_to_installations_scale),
+    stat = "identity", fill = "gray", alpha = 0.5
+  ) +
+  geom_line(aes(y = payback_years), color = "darkred", size = 1) +
+  geom_point(aes(y = payback_years), color = "darkred") +
+  scale_y_continuous(
+    name = "Payback Period (Years)",
+    breaks = seq(0, 60, by = 15),
+    sec.axis = sec_axis(
+      ~ . * payback_to_installations_scale,
+      name = "Quarterly Installations",
+      breaks = seq(0, 40000, by = 10000),
+      labels = function(x) ifelse(x < 0, "", scales::comma_format()(x))
+    ),
+    expand = c(0, 0)
+  ) +
+  scale_x_date(
+    date_labels = "%Y",
+    date_breaks = "1 year",
+    expand = c(0, 0)
+  ) +
+  labs(title = "Quarterly Averages of Payback Period for NSW Solar Installations", x = NULL) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y = element_text(color = "darkred"),
+    axis.text.y.left = element_text(color = "darkred"),
+    axis.title.y.right = element_text(color = "gray50"),
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor.y = element_line(color = "gray80"),
+    panel.grid.minor.x = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.ticks.x = element_line(color = "black"),
+    axis.ticks.length.x = unit(-0.2, "cm"),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5),
+    legend.position = "none"
+  )
+
+# Create roi_25yr_plot
+roi_25yr_plot <- ggplot(norm_25yr_quarterly_df, aes(x = InstallQuarter)) +
+  geom_bar(
+    aes(y = Quarterly_installs / net_savings_to_installations_scale),
+    stat = "identity", fill = "gray", alpha = 0.5
+  ) +
+  geom_line(aes(y = net_roi_pct * 100), color = "darkgreen", size = 1) +
+  geom_point(aes(y = net_roi_pct * 100), color = "darkgreen") +
+  scale_y_continuous(
+    name = "ROI (%)",
+    limits = c(-100, 400),
+    breaks = seq(-100, 400, by = 100),
+    labels = function(x) paste0(x, "%"),
+    sec.axis = sec_axis(
+      ~ . * net_savings_to_installations_scale,
+      name = "Quarterly Installations",
+      breaks = seq(0, 40000, by = 10000),
+      labels = function(x) ifelse(x < 0, "", scales::comma_format()(x))
+    ),
+    expand = c(0, 0)
+  ) +
+  scale_x_date(
+    date_labels = "%Y",
+    date_breaks = "1 year",
+    expand = c(0, 0)
+  ) +
+  labs(title = "Quarterly Averages of 25-Year ROI for NSW Solar Installations", x = NULL) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y = element_text(color = "darkgreen"),
+    axis.text.y.left = element_text(color = "darkgreen"),
+    axis.title.y.right = element_text(color = "gray50"),
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.ticks.x = element_line(color = "black"),
+    axis.ticks.length.x = unit(-0.2, "cm"),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5),
+    legend.position = "none"
+  )
+
+# Create irr_install_plot
+irr_install_plot <- ggplot(cf_irr_quarterly_df, aes(x = InstallQuarter)) +
+  geom_bar(
+    aes(y = Quarterly_installs * install_to_IRR_scale),
+    stat = "identity", fill = "gray", alpha = 0.5
+  ) +
+  geom_line(aes(y = Annual_IRR), color = "darkblue", size = 1) +
+  geom_point(aes(y = Annual_IRR), color = "darkblue") +
+  scale_y_continuous(
+    name = "IRR (%)",
+    limits = c(-0.1, 0.5),
+    breaks = seq(-0.1, 0.4, by = 0.1),
+    labels = percent_format(accuracy = 1),
+    sec.axis = sec_axis(
+      ~ . / install_to_IRR_scale,
+      name = "Quarterly Installations",
+      breaks = seq(-10000, 40000, by = 10000),
+      labels = c("", "0", "10,000", "20,000", "30,000", "40,000")
+    ),
+    expand = c(0, 0)
+  ) +
+  scale_x_date(
+    date_labels = "%Y",
+    date_breaks = "1 year",
+    expand = c(0, 0)
+  ) +
+  labs(title = "Quarterly Averages of 25-Year IRR for NSW Solar Installations", x = NULL) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y = element_text(color = "darkblue"),
+    axis.text.y.left = element_text(color = "darkblue"),
+    axis.title.y.right = element_text(color = "gray50"),
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.ticks.x = element_line(color = "black"),
+    axis.ticks.length.x = unit(-0.2, "cm"),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5),
+    legend.position = "none"
+  )
+
+# Combine all three plots
+combined_plot <- payback_plot / roi_25yr_plot / irr_install_plot + plot_layout(heights = c(1, 1, 1))
+
+# Display the final plot
+print(combined_plot)
+```
+
+## Current bill savings
+
+```{r}
+#| warning: false
+#| message: false
+
+# ----- Functions -----
+
+# Function to calculate export ratio
+calculate_export_ratio <- function(system_size) {
+  if (system_size %in% pv_export$`System size`) {
+    return(pv_export %>% filter(`System size` == system_size) %>% pull(Export))
+  } else {
+    return(Export_a * (1 - exp(-Export_k * system_size)))
+  }
+}
+
+# Function to extract year and month from sheet name
+extract_date_from_sheetname <- function(sheet_name) {
+  year <- str_extract(sheet_name, "\\d{4}")
+  month <- case_when(
+    grepl("Jan", sheet_name, ignore.case = TRUE) ~ "Jan",
+    grepl("Feb", sheet_name, ignore.case = TRUE) ~ "Feb",
+    grepl("Mar", sheet_name, ignore.case = TRUE) ~ "Mar",
+    grepl("Apr", sheet_name, ignore.case = TRUE) ~ "Apr",
+    grepl("May", sheet_name, ignore.case = TRUE) ~ "May",
+    grepl("Jun", sheet_name, ignore.case = TRUE) ~ "Jun",
+    grepl("Jul", sheet_name, ignore.case = TRUE) ~ "Jul",
+    grepl("Aug", sheet_name, ignore.case = TRUE) ~ "Aug",
+    grepl("Sep", sheet_name, ignore.case = TRUE) ~ "Sep",
+    grepl("Oct", sheet_name, ignore.case = TRUE) ~ "Oct",
+    grepl("Nov", sheet_name, ignore.case = TRUE) ~ "Nov",
+    grepl("Dec", sheet_name, ignore.case = TRUE) ~ "Dec",
+    TRUE ~ NA_character_
+  )
+  if (!is.na(year) & is.na(month)) month <- "Jul"
+  if (!is.na(year) & !is.na(month)) return(as.Date(paste("1", month, year), format = "%d %b %Y"))
+  return(NA)
+}
+
+# Standardise column names across datasets
+standardise_columns <- function(data) {
+  col_mapping <- list(
+    `Max_system_capacity_kW` = c("Max. system capacity (kW)", "Max. system capacity", "Max system capacity (kW)"),
+    `FiT_c_kWh` = c("FIT (c/kWh)", "FIT (c/kwh)"),
+    `First_kWh_per_quarter` = c("First kWh per quarter", "1st step (kWh/quarter)", "First step kWh/quarter"),
+    `Bonus_months` = c("First # months", "1st step (months)", "First step months"),
+    `Second_FiT_c_kWh` = c("2nd FIT", "2nd FIT (c/kWh)", "Second feed-in tariff")
+  )
+  for (standard_col in names(col_mapping)) {
+    for (possible_col in col_mapping[[standard_col]]) {
+      if (possible_col %in% names(data)) {
+        data <- data %>% rename(!!standard_col := all_of(possible_col))
+        break
+      }
+    }
+    if (!standard_col %in% names(data)) data[[standard_col]] <- NA
+  }
+  return(data)
+}
+
+# Function to enforce consistent column types
+enforce_column_types <- function(data) {
+  column_types <- list(
+    `State` = "character",
+    `DB` = "character",
+    `Meter type` = "character",
+    `Effective from` = "Date",
+    `Solar (y/n)` = "character",
+    `Solar meter fee (c/day)` = "numeric",
+    `Retailer` = "character",
+    `Name` = "character",
+    `Supply (c/day)` = "numeric",
+    `Max_system_capacity_kW` = "numeric",
+    `FiT_c_kWh` = "numeric",
+    `First_kWh_per_quarter` = "numeric",
+    `Bonus_months` = "numeric",
+    `Second_FiT_c_kWh` = "numeric",
+    `Single or peak rate (c/kWh)` = "numeric",
+    `block type` = "character",
+    `Peak 1st step (kWh)` = "numeric",
+    `Peak 2nd rate (c/kWh)` = "numeric",
+    `Peak 2nd step (kWh)` = "numeric",
+    `Peak 3rd rate (c/kWh)` = "numeric",
+    `Peak 3rd step (kWh)` = "numeric",
+    `Peak 4th rate (c/kWh)` = "numeric",
+    `Off-peak rate (c/kWh)` = "numeric",
+    `Off peak 1st step (kWh)` = "numeric",
+    `Off peak 2nd rate (c/kWh)` = "numeric",
+    `Off peak 2nd step (kWh)` = "numeric",
+    `Off peak 3rd rate (c/kWh)` = "numeric",
+    `Off peak 3rd step (kWh)` = "numeric",
+    `Off peak 4th rate (c/kWh)` = "numeric",
+    `Shoulder (c/kWh)` = "numeric"
+  )
+  
+  for (col in names(column_types)) {
+    if (col %in% names(data)) {
+      target_type <- column_types[[col]]
+      if (target_type == "numeric") {
+        data[[col]] <- suppressWarnings(as.numeric(data[[col]]))
+      } else if (target_type == "character") {
+        data[[col]] <- as.character(data[[col]])
+      } else if (target_type == "Date") {
+        data[[col]] <- suppressWarnings(as.Date(data[[col]], format = "%Y-%m-%d"))
+      }
+    }
+  }
+  return(data)
+}
+
+# Function to extract and clean specific columns from a sheet
+extract_columns <- function(sheet_name, file_path) {
+  if (!file.exists(file_path)) {
+    warning(paste("File does not exist:", file_path))
+    return(NULL)
+  }
+  data <- read_excel(file_path, sheet = sheet_name, col_names = TRUE)
+  data <- standardise_columns(data)
+  data <- enforce_column_types(data)
+  target_columns <- c(
+    "State", "DB", "Meter type", "Effective from", "Solar (y/n)", "Solar meter fee (c/day)",
+    "Retailer", "Name", "Supply (c/day)", "Max_system_capacity_kW",
+    "FiT_c_kWh", "First_kWh_per_quarter", "Bonus_months", "Second_FiT_c_kWh",
+    "Single or peak rate (c/kWh)", "block type", "Peak 1st step (kWh)",
+    "Peak 2nd rate (c/kWh)", "Peak 2nd step (kWh)", "Peak 3rd rate (c/kWh)",
+    "Peak 3rd step (kWh)", "Peak 4th rate (c/kWh)",
+    "Off-peak rate (c/kWh)", "Off peak 1st step (kWh)", "Off peak 2nd rate (c/kWh)",
+    "Off peak 2nd step (kWh)", "Off peak 3rd rate (c/kWh)", "Off peak 3rd step (kWh)",
+    "Off peak 4th rate (c/kWh)", "Shoulder (c/kWh)"
+  )
+  matched_columns <- intersect(names(data), target_columns)
+  if (length(matched_columns) > 0) {
+    return(
+      data %>%
+        select(all_of(matched_columns)) %>%
+        mutate(Period = extract_date_from_sheetname(sheet_name))
+    )
+  }
+  return(NULL)
+}
+
+# Function to calculate effective FiT rate accounting for solar export
+calculate_effective_fit_rate <- function(bonus_months, first_kWh_block, fit_rate, second_fit_rate, qtr_export) {
+  if (!is.na(bonus_months)) return(second_fit_rate)
+  if (is.na(first_kWh_block)) return(fit_rate)
+  first_kWh_cap <- min(qtr_export, first_kWh_block)
+  remaining_kWh <- qtr_export - first_kWh_cap
+  weighted_avg_fit <- (first_kWh_cap * fit_rate + remaining_kWh * second_fit_rate) / qtr_export
+  return(weighted_avg_fit)
+}
+
+# Function to calculate effective usage rate
+calculate_effective_rate <- function(
+    meter_type, shoulder_rate, off_peak_rate, single_rate, block1_step, block2_rate, block2_step,
+    block3_rate, block3_step, block4_rate, avg_consmp_qtr
+) {
+  if (meter_type == "TOU") {
+    if (is.na(shoulder_rate)) {
+      if (!is.na(off_peak_rate)) {
+        message("No shoulder rate available; using off-peak rate instead.")
+        return(off_peak_rate)
+      } else {
+        message("No shoulder or off-peak rate available; using single rate instead.")
+        return(single_rate)
+      }
+    }
+    return(shoulder_rate)
+  }
+  
+  if (is.na(block1_step)) return(single_rate)
+  
+  block2_rate <- ifelse(is.na(block2_rate), single_rate, block2_rate)
+  block3_rate <- ifelse(is.na(block3_rate), block2_rate, block3_rate)
+  block4_rate <- ifelse(is.na(block4_rate), block3_rate, block4_rate)
+  
+  block1_step <- ifelse(is.na(block1_step), avg_consmp_qtr, block1_step)
+  block2_step <- ifelse(is.na(block2_step), avg_consmp_qtr, block2_step)
+  block3_step <- ifelse(is.na(block3_step), avg_consmp_qtr, block3_step)
+  
+  block1_consumption <- min(block1_step, avg_consmp_qtr)
+  block2_consumption <- max(0, min(block2_step - block1_step, avg_consmp_qtr - block1_step))
+  block3_consumption <- max(0, min(block3_step - block2_step, avg_consmp_qtr - block2_step))
+  block4_consumption <- max(0, avg_consmp_qtr - block3_step)
+  
+  effective_rate <- (single_rate * block1_consumption +
+                       block2_rate * block2_consumption +
+                       block3_rate * block3_consumption +
+                       block4_rate * block4_consumption) / avg_consmp_qtr
+  return(effective_rate)
+}
+
+# ----- Inputs -----
+
+# List of file names with full path
+file_names <- c(
+  here(input_folder, "Solar market offers - NSW.xlsx"),
+  here(input_folder, "Solar market offers - QLD.xlsx"),
+  here(input_folder, "Solar market offers - SA.xlsx"),
+  here(input_folder, "Solar market offers - TAS.xlsx"),
+  here(input_folder, "Solar market offers - VIC.xlsx"),
+  here(input_folder, "Solar market offers - ACT.xlsx")
+)
+
+# Verify files exist
+for (file in file_names) {
+  if (!file.exists(file)) {
+    stop(paste("File does not exist:", file))
+  }
+}
+
+# Annual output per kW by state (source: ACIL Allen)
+pv_output <- data.frame(
+  State = c("NSW", "VIC", "QLD", "SA", "WA", "TAS", "ACT", "NT"),
+  Output_per_KW = c(1.383, 1.248, 1.385, 1.384, 1.390, 1.185, 1.382, 1.546) * 1000
+)
+
+# Load PV export data
+pv_export <- load_solar_data(sheet = "Export", skip = 2) %>%
+  slice(1:9) %>%
+  mutate(
+    Export = as.numeric(`SunWiz Export Ratios`),
+    `System size` = as.numeric(`System size`)
+  )
+
+# Export parameters
+pv_export_param <- load_solar_data(sheet = "Export", range = "B35:C36")
+Export_a <- pv_export_param[[1]][1]  # Export parameter "a"
+Export_k <- pv_export_param[[2]][1]  # Export parameter "k"
+
+# System sizes to evaluate
+pv_sizes <- c(3, 6, 9)
+
+# Assumed electricity consumption and costs
+electricity_consmp_annual <- 5383 # source AER average across states
+electricity_consmp_qtr <- electricity_consmp_annual / 4
+cost_per_kw <- 1000  # Installation cost per kW ($)
+
+# Initialize an empty dataframe for results
+fit_summary_all_sizes <- data.frame()
+
+# Iterate over each system size
+for (pv_size in pv_sizes) {
+  message(paste("Calculating for system size:", pv_size, "kW"))
+  
+  # Calculate PV output and export for each state
+  pv_output <- pv_output %>%
+    mutate(
+      Annual_output = Output_per_KW * pv_size,
+      pv_export_ratio = calculate_export_ratio(pv_size),
+      Annual_export = Annual_output * pv_export_ratio,
+      Qtr_output = Annual_output / 4,
+      Qtr_export = Annual_export / 4
+    )
+  
+  # Initialize dataframe to store FiT data
+  all_fit_combined_df <- data.frame()
+  
+  # Iterate over each state and file to extract and process data
+  for (file in file_names) {
+    sheet_names <- excel_sheets(file)
+    fit_df <- lapply(sheet_names, function(sheet) extract_columns(sheet, file))
+    fit_combined_df <- bind_rows(fit_df)
+    
+    if (is.null(fit_combined_df)) next
+    
+    # Rename distributors for consistency
+    fit_combined_df$DB <- fit_combined_df$DB %>%
+      gsub("^AusGrid$", "Ausgrid", .) %>%
+      gsub("^SA Power$", "SA Power Networks", .) %>%
+      gsub("AusNet Services", "AusNet", .) %>%
+      gsub("Jemena Network", "Jemena", .) %>%
+      gsub("Citipower", "CitiPower", .) %>%
+      gsub("ActewAGL", "Evoenergy", .) %>%
+      gsub("Aurora", "TasNetworks", .)
+    
+    # Make TOU and Two rate interchangeable
+    fit_combined_df$`Meter type` <- fit_combined_df$`Meter type` %>%
+      gsub("Two Rate|two rate|time-of-use", "TOU", ., ignore.case = TRUE)
+    
+    # Convert NA to 0 for `Solar meter fee`
+    fit_combined_df <- fit_combined_df %>%
+      mutate(`Solar meter fee (c/day)` = ifelse(is.na(`Solar meter fee (c/day)`), 0, `Solar meter fee (c/day)`))
+    
+    # Get Qtr_export for specific state
+    state_name <- unique(fit_combined_df$State)
+    qtr_export_state <- pv_output %>%
+      filter(State == state_name) %>%
+      pull(Qtr_export)
+    
+    # Calculate effective usage rate and FiT rate
+    fit_combined_df <- fit_combined_df %>%
+      filter(`Meter type` %in% c("Single", "TOU")) %>%
+      mutate(
+        effective_FiT = mapply(
+          calculate_effective_fit_rate,
+          `Bonus_months`,
+          `First_kWh_per_quarter`,
+          `FiT_c_kWh`,
+          `Second_FiT_c_kWh`,
+          MoreArgs = list(qtr_export = qtr_export_state)
+        ),
+        effective_usage_rate = mapply(
+          calculate_effective_rate,
+          `Meter type`, `Shoulder (c/kWh)`, `Off-peak rate (c/kWh)`,
+          `Single or peak rate (c/kWh)`, `Peak 1st step (kWh)`, `Peak 2nd rate (c/kWh)`,
+          `Peak 2nd step (kWh)`, `Peak 3rd rate (c/kWh)`, `Peak 3rd step (kWh)`,
+          `Peak 4th rate (c/kWh)`, MoreArgs = list(avg_consmp_qtr = electricity_consmp_qtr)
+        )
+      )
+    
+    all_fit_combined_df <- bind_rows(all_fit_combined_df, fit_combined_df)
+  }
+  
+  # Clean and calculate weighted average PV savings
+  all_fit_combined_df <- all_fit_combined_df %>%
+    filter(!(is.na(effective_FiT) | is.na(effective_usage_rate) | is.na(Period) | is.na(DB))) %>%
+    mutate(
+      pv_export_ratio = pv_output$pv_export_ratio[match(State, pv_output$State)],
+      effective_gross_savings = effective_FiT * pv_export_ratio + effective_usage_rate * (1 - pv_export_ratio),
+      pv_annual_output = pv_output$Annual_output[match(State, pv_output$State)],
+      Annual_solar_meter_fee = `Solar meter fee (c/day)` * 365.25,
+      solar_meter_fee_kWh = Annual_solar_meter_fee / pv_annual_output,
+      pv_net_savings = effective_gross_savings - solar_meter_fee_kWh,
+      annual_savings = pv_annual_output * (pv_net_savings / 100),
+      total_cost = pv_size * cost_per_kw,
+      payback_period = total_cost / annual_savings
+    )
+  
+  # Summarise data
+  fit_summary <- all_fit_combined_df %>%
+    group_by(DB, Period, `Meter type`) %>%
+    summarise(
+      avg_fit_rate = mean(effective_FiT, na.rm = TRUE),
+      median_fit_rate = median(effective_FiT, na.rm = TRUE),
+      max_fit_rate = max(effective_FiT, na.rm = TRUE),
+      min_fit_rate = min(effective_FiT, na.rm = TRUE),
+      avg_usage_rate = mean(effective_usage_rate, na.rm = TRUE),
+      median_usage_rate = median(effective_usage_rate, na.rm = TRUE),
+      max_usage_rate = max(effective_usage_rate, na.rm = TRUE),
+      min_usage_rate = min(effective_usage_rate, na.rm = TRUE),
+      avg_net_savings = mean(pv_net_savings, na.rm = TRUE),
+      median_net_savings = median(pv_net_savings, na.rm = TRUE),
+      max_net_savings = max(pv_net_savings, na.rm = TRUE),
+      min_net_savings = min(pv_net_savings, na.rm = TRUE),
+      avg_annual_savings = mean(annual_savings, na.rm = TRUE),
+      median_annual_savings = median(annual_savings, na.rm = TRUE),
+      avg_payback_period = mean(payback_period, na.rm = TRUE),
+      median_payback_period = median(payback_period, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    mutate(pv_size = pv_size)
+  
+  fit_summary_all_sizes <- bind_rows(fit_summary_all_sizes, fit_summary)
+}
+
+# Rearrange and optionally write to CSV
+fit_summary_all_sizes <- fit_summary_all_sizes %>%
+  arrange(DB, Period, `Meter type`, pv_size)
+
+# Optionally write to CSV (commented out)
+# write.csv(fit_summary_all_sizes, here("solar_fit_db_all_sizes.csv"), row.names = FALSE)
+
+# ----- Plotting -----
+
+# Create a mapping of DBs to states
+db_state_mapping <- c(
+  "Ausgrid" = "NSW",
+  "AusNet" = "VIC",
+  "CitiPower" = "VIC",
+  "Endeavour" = "NSW",
+  "Energex" = "QLD",
+  "Essential Energy" = "NSW",
+  "Evoenergy" = "ACT",
+  "Jemena" = "VIC",
+  "Powercor" = "VIC",
+  "SA Power Networks" = "SA",
+  "TasNetworks" = "TAS",
+  "United Energy" = "VIC"
+)
+
+# Prepare data for plotting
+plot_data_latest <- fit_summary_all_sizes %>%
+  group_by(DB, `Meter type`, pv_size) %>%
+  filter(Period == max(Period)) %>%
+  ungroup() %>%
+  mutate(State = db_state_mapping[DB]) %>%
+  arrange(State, DB)
+
+# Specify the desired order for states
+state_order <- c("NSW", "VIC", "QLD", "SA", "TAS", "ACT")
+
+# Convert State to a factor
+plot_data_latest$State <- factor(plot_data_latest$State, levels = state_order)
+
+# Convert pv_size to factor
+plot_data_latest$pv_size <- factor(plot_data_latest$pv_size, levels = c(3, 6, 9), labels = c("3kW", "6kW", "9kW"))
+
+# Custom labeller for facet subtitles
+meter_type_labels <- c("Single" = "Single Rate", "TOU" = "Time-of-Use")
+
+# ----- Load Customer Numbers -----
+
+dnsps <- read_excel(here(input_folder, "Rooftop_solar_calc_data.xlsx"), sheet = "Customers", range = "A23:A36", col_names = "DNSP_Name")
+customer_numbers <- read_excel(here(input_folder, "Rooftop_solar_calc_data.xlsx"), sheet = "Customers", range = "U23:U36", col_names = "Customers")
+
+customer_data <- bind_cols(dnsps, customer_numbers) %>%
+  mutate(Customers = as.numeric(Customers)) %>%
+  mutate(DNSP_Name = DNSP_Name %>%
+           gsub("^AusGrid$", "Ausgrid", .) %>%
+           gsub("^SA Power$", "SA Power Networks", .) %>%
+           gsub("AusNet Services", "AusNet", .) %>%
+           gsub("Jemena Network", "Jemena", .) %>%
+           gsub("Citipower", "CitiPower", .) %>%
+           gsub("ActewAGL", "Evoenergy", .) %>%
+           gsub("Aurora", "TasNetworks", .))
+
+# ----- Merge Customer Numbers with Savings Data -----
+
+weighted_data <- plot_data_latest %>%
+  left_join(customer_data, by = c("DB" = "DNSP_Name")) %>%
+  filter(!is.na(Customers))
+
+# ----- Calculate Weighted Averages per State and System Size -----
+
+state_weighted_savings <- weighted_data %>%
+  group_by(State, pv_size, `Meter type`) %>%
+  summarise(
+    weighted_avg_savings = sum(median_net_savings * Customers, na.rm = TRUE) / sum(Customers, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+state_weighted_savings$State <- factor(state_weighted_savings$State, levels = state_order)
+
+# ----- Plot 1: Median Rooftop Solar Savings Rate by DNSP, Meter Type, and System Size -----
+
+plot_data_latest <- plot_data_latest %>%
+  mutate(DB_with_state = paste(DB, " (", State, ")", sep = ""))
+
+dnsps_order <- c(
+  "Ausgrid (NSW)",
+  "Endeavour (NSW)",
+  "Essential Energy (NSW)",
+  "AusNet (VIC)",
+  "CitiPower (VIC)",
+  "Jemena (VIC)",
+  "Powercor (VIC)",
+  "United Energy (VIC)",
+  "Energex (QLD)",
+  "SA Power Networks (SA)",
+  "TasNetworks (TAS)",
+  "Evoenergy (ACT)"
+)
+
+plot_data_latest$DB_with_state <- factor(plot_data_latest$DB_with_state, levels = dnsps_order)
+
+# Plot
+ggplot(plot_data_latest, aes(x = DB_with_state, y = median_net_savings, fill = pv_size)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = round(median_net_savings, 1)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.5, size = 3) +
+  theme_minimal() +
+  labs(
+    title = "Solar customer median bill savings per kWh of solar output",
+    subtitle = "By DNSP, Tariff Type, and System Size (Jul-24)",
+    x = NULL,
+    y = "Bill savings (cents/kWh)",
+    fill = "System Size"
+  ) +
+  theme(
+    text = element_text(size = 12),
+    axis.text.x = element_text(size = 10, angle = 0, hjust = 0.5),  # Straighten labels
+    axis.text.y = element_blank(),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    panel.grid = element_blank()
+  ) +
+  geom_hline(yintercept = 4, linetype = "dashed", color = "red", size = 1) +
+  annotate("label", x = 1, y = 3, label = "System savings from rooftop solar (4 c/kWh)",
+           hjust = 0, size = 4, color = "Darkred", fontface = "bold",
+           fill = "white", alpha = 0.7) +
+  geom_segment(data = plot_data_latest %>% filter(`Meter type` == "TOU"),
+               aes(x = 0.5, xend = 12.5, y = 0, yend = 0), colour = "black", size = 0.5) +  # Black line for bottom facet
+  scale_fill_manual(values = c("3kW" = "steelblue", "6kW" = "darkorange", "9kW" = "forestgreen")) +
+  facet_wrap(~`Meter type`, ncol = 1, labeller = labeller(`Meter type` = meter_type_labels)) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 8))
+
+# ----- Plot 2: Weighted Average Savings per State and System Size -----
+
+annotate_savings <- tibble(`Meter type` = c("Single"), label = "System savings from rooftop solar (4 c/kWh)")
+
+ggplot(state_weighted_savings, aes(x = State, y = weighted_avg_savings, fill = pv_size)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = round(weighted_avg_savings, 1)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.5, size = 3.25) +
+  theme_minimal() +
+  labs(
+    title = "Solar customer median bill savings per kWh of solar output",
+    subtitle = "Weighted average savings for each state, weighted by customer numbers per DNSP (Jul-24)",
+    x = NULL,
+    y = "Bill savings (cents / kWh)",
+    fill = "System size: "
+  ) +
+  theme(
+    text = element_text(size = 12),
+    axis.text.x = element_text(size = 12, angle = 0, hjust = 0.5, margin = margin(t = -20), colour = "black"),
+    axis.text.y = element_blank(),
+    axis.title.y = element_text(size = 14, hjust = 0.5, face = "bold", margin = margin(l = 10)),
+    plot.title = element_text(size = 16, face = "bold", margin = margin(t = 10, b = 15)),
+    plot.subtitle = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    panel.grid = element_blank(),
+    strip.text = element_text(size = 14, colour = "black", margin = margin(b = 10, t = 5), face = "bold"),
+    legend.position = "bottom"
+  ) +
+  geom_hline(yintercept = 4, linetype = "dashed", color = "red", size = 1) +
+  geom_label(data = annotate_savings, x = 0.7, y = 3.3, aes(label = label),
+             hjust = 0, size = 5, color = "Darkred", fontface = "bold",
+             fill = "white", alpha = 0.7) +
+  geom_segment(aes(x = 0.5, xend = 6.5, y = 0, yend = 0), colour = "black", size = 0.5) +
+  scale_fill_manual(values = c("3kW" = "steelblue", "6kW" = "darkorange", "9kW" = "forestgreen")) +
+  facet_wrap(~`Meter type`, nrow = 1, labeller = labeller(`Meter type` = meter_type_labels))
+```
