@@ -1,5 +1,5 @@
 # Economics of Rooftop Solar
-_A companion repository to the Centre for Independent Studies paper ![**Rooftop Solar: Paradise Lost**] (https://www.cis.org.au/publication/rooftop-solar-paradise-lost) (May 2025)_
+_A companion repository to the Centre for Independent Studies paper **[“Rooftop Solar: Paradise Lost”](https://www.cis.org.au/publication/rooftop-solar-paradise-lost)** (May 2025)._
 
 ---
 ## Executive summary
