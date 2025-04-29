@@ -20,6 +20,10 @@ library(readxl)
 library(tibble)
 library(here)
 library(patchwork)
+library(purrr)
+library(stringr)
+library(zoo)
+library(jrvFinance)
 ```
 
 Input folder and helper function
@@ -169,11 +173,15 @@ ggplot(pd, aes(x = Month)) +
     axis.ticks.length    = unit(-0.15, "cm"),   # inside ticks
     axis.ticks           = element_line(color = "black"),
     strip.background     = element_blank(),
-    strip.text           = element_text(face = "bold")
+    strip.text           = element_text(face = "bold"),
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA) 
   )
+
+ggsave(here("03-outputs", "rooftop_pv_installation_size_state.png"), width = 400, height = 200, units = "mm")
 ```
 
-### Calculate rooftop PV capital cost, rebate, and installation cost
+###  Calculate rooftop PV capital cost, rebate, and installation cost
 
 The annual cost data (\`pv_cost\`) comes from the National Survey Report of PV Power Applications. The table column states “\\\$/kW” but in practice we interpret these values as “\\\$ per Watt.” We interpolate these annual values linearly to get a smoother monthly cost.
 
@@ -349,7 +357,10 @@ plot2 <- ggplot(annual_avg_data, aes(x = Year)) +
     legend.position = "top",
     panel.grid.minor = element_blank(),
     panel.grid.major.x = element_blank(),
-    text = element_text(size = 14)
+    text = element_text(size = 14),
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA)
+    
   ) +
   scale_color_manual(values = c("Installation Cost ($)" = "blue")) +
   scale_fill_manual(values = c("Annual Average System Size (kW)" = "gray"))
@@ -357,11 +368,15 @@ plot2 <- ggplot(annual_avg_data, aes(x = Year)) +
 # Display plots
 print(plot1)
 print(plot2)
+
+ggsave(here("03-outputs", "rooftop_pv_typical_cost_size_nsw.png"))
 ```
 
 ### Rebate & out-of-pocket expense for 1.5 kW system
 
 ```{r}
+#| warning: false
+#| message: false
 
 # Define system size to model
 pv_system_size <- 1.5 # kW system size
@@ -433,7 +448,7 @@ get_total_rebate_3kw <- function(install_date, stc_price) {
 }
 
 # Build a final summary data frame
-three_kw_rebate_df <- annual_kw_cost_df %>%
+rooftop_pv_rebate_df <- annual_kw_cost_df %>%
   rowwise() %>%
   mutate(
     # Pre-rebate cost for the selected system size
@@ -453,8 +468,8 @@ three_kw_rebate_df <- annual_kw_cost_df %>%
   ) %>%
   ungroup()
 
-# Construct three_kw_long_rebate for the stacked bar plot (percentages)
-three_kw_long_rebate <- three_kw_rebate_df %>%
+# Construct solar rebate df for the stacked bar plot (percentages)
+rooftop_pv_rebate_df_long <- rooftop_pv_rebate_df %>%
   select(Year, RebatePct, OutofPocketPct) %>%
   pivot_longer(cols = c(RebatePct, OutofPocketPct),
                names_to = "CostComponent",
@@ -468,12 +483,12 @@ three_kw_long_rebate <- three_kw_rebate_df %>%
 household_cost_scale <- 20000  # Maximum household cost in $AUD
 
 # Create the plot
-ggplot(three_kw_long_rebate, aes(x = factor(Year), y = Value, fill = CostComponent)) +
+ggplot(rooftop_pv_rebate_df_long, aes(x = factor(Year), y = Value, fill = CostComponent)) +
   geom_col(position = "stack") +  # Stacked bars
-  geom_line(data = three_kw_rebate_df, 
+  geom_line(data = rooftop_pv_rebate_df, 
             aes(x = factor(Year), y = OutOfPocket / household_cost_scale, group = 1, color = "Household Out-of-Pocket ($)"), 
             size = 1, inherit.aes = FALSE) +
-  geom_point(data = three_kw_rebate_df, 
+  geom_point(data = rooftop_pv_rebate_df, 
              aes(x = factor(Year), y = OutOfPocket / household_cost_scale, color = "Household Out-of-Pocket ($)"), 
              size = 2, inherit.aes = FALSE) +
   scale_y_continuous(
@@ -504,7 +519,7 @@ ggplot(three_kw_long_rebate, aes(x = factor(Year), y = Value, fill = CostCompone
     labels = c("Rebates (%)", "Household Out-of-Pocket (%)")  # Updated legend labels for fill
   ) +
   scale_color_manual(
-    values = c("Household Out-of-Pocket ($)" = "gray20"),
+    values = c("Household Out-of-Pocket ($)" = "gray30"),
     labels = c("Household Out-of-Pocket ($)")  # Updated legend labels for line
   ) +
   theme_minimal() +
@@ -525,8 +540,12 @@ ggplot(three_kw_long_rebate, aes(x = factor(Year), y = Value, fill = CostCompone
     axis.ticks.length.y.right = unit(0.15, "cm"),
     plot.title = element_text(hjust = 0, size = 15, margin = margin(b = 15, t = 15)), 
     legend.text = element_text(size = 11),
-    legend.position = "top"  # Position the legend at the top
+    legend.position = "top",
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA)
   )
+
+ggsave(here("03-outputs", "solar_rebate_vs_pocket.png"))
 ```
 
 ### Solar production and export
@@ -1022,14 +1041,14 @@ payback_plot <- ggplot(payback_df_quarterly, aes(x = Quarter_Start)) +
     expand = c(0, 0)
   ) +
   scale_x_date(
-    date_labels = "%Y",
+    date_labels = "'%y",
     date_breaks = "1 year",
     expand = c(0, 0)
   ) +
   labs(title = "Quarterly Averages of Payback Period for NSW Solar Installations", x = NULL) +
   theme_minimal() +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
     axis.title.y = element_text(color = "darkred"),
     axis.text.y.left = element_text(color = "darkred"),
     axis.title.y.right = element_text(color = "gray50"),
@@ -1038,9 +1057,11 @@ payback_plot <- ggplot(payback_df_quarterly, aes(x = Quarter_Start)) +
     panel.grid.minor.x = element_blank(),
     panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
     axis.ticks.x = element_line(color = "black"),
-    axis.ticks.length.x = unit(-0.2, "cm"),
+    axis.ticks.length.x = unit(-0.1, "cm"),
     plot.margin = margin(t = 5, r = 5, b = 5, l = 5),
-    legend.position = "none"
+    legend.position = "none",
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA)
   )
 
 # Create roi_25yr_plot
@@ -1065,14 +1086,14 @@ roi_25yr_plot <- ggplot(norm_25yr_quarterly_df, aes(x = InstallQuarter)) +
     expand = c(0, 0)
   ) +
   scale_x_date(
-    date_labels = "%Y",
+    date_labels = "'%y",
     date_breaks = "1 year",
     expand = c(0, 0)
   ) +
   labs(title = "Quarterly Averages of 25-Year ROI for NSW Solar Installations", x = NULL) +
   theme_minimal() +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
     axis.title.y = element_text(color = "darkgreen"),
     axis.text.y.left = element_text(color = "darkgreen"),
     axis.title.y.right = element_text(color = "gray50"),
@@ -1080,9 +1101,11 @@ roi_25yr_plot <- ggplot(norm_25yr_quarterly_df, aes(x = InstallQuarter)) +
     panel.grid.minor = element_blank(),
     panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
     axis.ticks.x = element_line(color = "black"),
-    axis.ticks.length.x = unit(-0.2, "cm"),
+    axis.ticks.length.x = unit(-0.1, "cm"),
     plot.margin = margin(t = 5, r = 5, b = 5, l = 5),
-    legend.position = "none"
+    legend.position = "none",
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA)
   )
 
 # Create irr_install_plot
@@ -1107,14 +1130,14 @@ irr_install_plot <- ggplot(cf_irr_quarterly_df, aes(x = InstallQuarter)) +
     expand = c(0, 0)
   ) +
   scale_x_date(
-    date_labels = "%Y",
+    date_labels = "'%y",
     date_breaks = "1 year",
     expand = c(0, 0)
   ) +
   labs(title = "Quarterly Averages of 25-Year IRR for NSW Solar Installations", x = NULL) +
   theme_minimal() +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
     axis.title.y = element_text(color = "darkblue"),
     axis.text.y.left = element_text(color = "darkblue"),
     axis.title.y.right = element_text(color = "gray50"),
@@ -1122,9 +1145,11 @@ irr_install_plot <- ggplot(cf_irr_quarterly_df, aes(x = InstallQuarter)) +
     panel.grid.minor = element_blank(),
     panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
     axis.ticks.x = element_line(color = "black"),
-    axis.ticks.length.x = unit(-0.2, "cm"),
+    axis.ticks.length.x = unit(-0.1, "cm"),
     plot.margin = margin(t = 5, r = 5, b = 5, l = 5),
-    legend.position = "none"
+    legend.position = "none",
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA)
   )
 
 # Combine all three plots
@@ -1132,6 +1157,8 @@ combined_plot <- payback_plot / roi_25yr_plot / irr_install_plot + plot_layout(h
 
 # Display the final plot
 print(combined_plot)
+
+ggsave(here("03-outputs", "rooftop_pv_fincial_return.png"), plot = combined_plot, width = 25, height = 20, units = "cm")
 ```
 
 ## Current bill savings
@@ -1612,7 +1639,9 @@ ggplot(plot_data_latest, aes(x = DB_with_state, y = median_net_savings, fill = p
     plot.subtitle = element_text(size = 12),
     legend.text = element_text(size = 12),
     legend.title = element_text(size = 12),
-    panel.grid = element_blank()
+    panel.grid = element_blank(),
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA)
   ) +
   geom_hline(yintercept = 4, linetype = "dashed", color = "red", size = 1) +
   annotate("label", x = 1, y = 3, label = "System savings from rooftop solar (4 c/kWh)",
@@ -1623,6 +1652,8 @@ ggplot(plot_data_latest, aes(x = DB_with_state, y = median_net_savings, fill = p
   scale_fill_manual(values = c("3kW" = "steelblue", "6kW" = "darkorange", "9kW" = "forestgreen")) +
   facet_wrap(~`Meter type`, ncol = 1, labeller = labeller(`Meter type` = meter_type_labels)) +
   scale_x_discrete(labels = function(x) str_wrap(x, width = 8))
+
+ggsave(here("03-outputs", "solar_bill_savings_kwh_output_dnsps.png"), width = 25, height = 20, units = "cm" )
 
 # ----- Plot 2: Weighted Average Savings per State and System Size -----
 
@@ -1646,13 +1677,15 @@ ggplot(state_weighted_savings, aes(x = State, y = weighted_avg_savings, fill = p
     axis.text.x = element_text(size = 12, angle = 0, hjust = 0.5, margin = margin(t = -20), colour = "black"),
     axis.text.y = element_blank(),
     axis.title.y = element_text(size = 14, hjust = 0.5, face = "bold", margin = margin(l = 10)),
-    plot.title = element_text(size = 16, face = "bold", margin = margin(t = 10, b = 15)),
+    plot.title = element_text(size = 16, face = "bold", margin = margin(t = 10, b = 5)),
     plot.subtitle = element_text(size = 12),
     legend.text = element_text(size = 12),
     legend.title = element_text(size = 12),
     panel.grid = element_blank(),
     strip.text = element_text(size = 14, colour = "black", margin = margin(b = 10, t = 5), face = "bold"),
-    legend.position = "bottom"
+    legend.position = "bottom",
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA)
   ) +
   geom_hline(yintercept = 4, linetype = "dashed", color = "red", size = 1) +
   geom_label(data = annotate_savings, x = 0.7, y = 3.3, aes(label = label),
@@ -1661,4 +1694,6 @@ ggplot(state_weighted_savings, aes(x = State, y = weighted_avg_savings, fill = p
   geom_segment(aes(x = 0.5, xend = 6.5, y = 0, yend = 0), colour = "black", size = 0.5) +
   scale_fill_manual(values = c("3kW" = "steelblue", "6kW" = "darkorange", "9kW" = "forestgreen")) +
   facet_wrap(~`Meter type`, nrow = 1, labeller = labeller(`Meter type` = meter_type_labels))
+
+ggsave(here("03-outputs", "solar_bill_savings_kwh_output_state.png"), width = 25, height = 20, units = "cm" )
 ```

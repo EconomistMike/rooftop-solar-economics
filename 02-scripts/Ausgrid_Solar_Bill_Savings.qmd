@@ -1,0 +1,1635 @@
+---
+title: "Ausgrid Solar Customer Bill Savings"
+format: html
+editor: visual
+---
+
+## Initialise
+
+```{r}
+#| message: false
+#| echo: false
+#| results: 'hide'
+
+library(readxl)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(ggrepel)
+library(patchwork)
+library(here)
+library(forcats)
+```
+
+Define file paths and corresponding years
+
+```{r}
+
+# Define file paths and corresponding years
+input_folder <- here("01-inputs")
+
+files <- c("nsw-solar-home-electricity-data-2010-11.csv",
+           "nsw-solar-home-electricity-data-2011-12.csv",
+           "nsw-solar-home-electricity-data-2012-13.csv")
+
+years <- c("2010-11", "2011-12", "2012-13")
+```
+
+## Consumption Profile
+
+Load and combine csv files into one dataframe
+
+```{r}
+df_all <- map_dfr(seq_along(files), ~
+  read.csv(here("01-inputs", files[.x])) %>%
+    mutate(Year = years[.x])
+)
+```
+
+Clean consumption data
+
+```{r}
+df_TC_avg_combined <- df_all %>%
+  filter(Consumption.Category %in% c("GC", "CL")) %>%  # Select General Consumption and Controlled Load
+  mutate(date = as.Date(date, format = "%d/%m/%Y"),
+         month = month(date),
+         Season = case_when(month %in% c(11, 12, 1, 2, 3) ~ "Nov-Mar",
+                            month %in% c(4, 5) ~ "Apr-May",
+                            month %in% c(6, 7, 8) ~ "Jun-Aug",
+                            month %in% c(9, 10) ~ "Sep-Oct")) %>%
+  pivot_longer(cols = starts_with("X"), names_to = "half_hr_label", values_to = "kWh") %>%
+  mutate(half_hr_label = str_remove(half_hr_label, "^X"),
+         hr_of_day = floor(as.numeric(str_replace(half_hr_label, "\\.", ".")))) %>%
+  group_by(Year, Customer, date, hr_of_day, Season, month) %>%
+  summarise(hourly_kWh = sum(kWh, na.rm = TRUE), .groups = "drop") %>%  # Sum half-hourly to hourly
+  group_by(Year, Customer, month, hr_of_day, Season) %>%
+  summarise(customer_avg_hourly_kWh = mean(hourly_kWh, na.rm = TRUE), .groups = "drop") %>%  # Customer averages
+  group_by(Year, month, hr_of_day, Season) %>%
+  summarise(avg_hourly_kWh = mean(customer_avg_hourly_kWh, na.rm = TRUE), .groups = "drop") %>%  # Overall averages
+  ungroup() %>%
+  bind_rows(., 
+            group_by(., month, hr_of_day, Season) %>%
+              summarise(avg_hourly_kWh = mean(avg_hourly_kWh, na.rm = TRUE), .groups = "drop") %>%
+              mutate(Year = "All 3 Years")) %>%  # Add 3-year average by month and hour
+  mutate(Month_name = factor(month.abb[month], levels = month.abb))  # Add readable month names
+
+print(df_TC_avg_combined)
+```
+
+### Plot consumption for each Year + All 3 Years
+
+```{r}
+ggplot(df_TC_avg_combined, aes(x = hr_of_day, y = avg_hourly_kWh, color = Year)) +
+  geom_line(size = 1) +
+  facet_wrap(~ Month_name, nrow = 4) +
+  scale_x_continuous(
+    breaks = 0:23,
+    #labels = sprintf("%02d:00", 0:23)
+  ) +
+  labs(
+    title = "Monthly Average Hourly Total Consumption",
+    x = NULL,
+    y = "kWh"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x         = element_text(angle = 0, hjust = 1),
+    panel.grid.minor    = element_blank()
+  )
+```
+
+### Plot hourly average consumption for all three years by month
+
+```{r}
+
+# Adjust label positions for the last hour of the day
+label_positions <- df_TC_avg_combined %>%
+  filter(Year == "All 3 Years", hr_of_day == max(hr_of_day)) %>% # Last hour of day
+  mutate(label_x = hr_of_day + 0.5) # Shift labels slightly to the right
+
+# Plot
+ggplot(df_TC_avg_combined %>% filter(Year == "All 3 Years"), 
+       aes(x = hr_of_day, y = avg_hourly_kWh, color = Month_name, group = Month_name)) +
+  geom_line(size = 1) +
+  geom_text_repel(
+    data = label_positions,
+    aes(x = label_x, y = avg_hourly_kWh, label = Month_name, color = Month_name),
+    hjust = 0, # Align text to the left
+    direction = "y", # Adjust placement along the y-axis
+    segment.color = NA, # Remove line segments
+    size = 4, # Adjust text size
+    max.overlaps = Inf # Ensure all labels are placed
+  ) +
+  scale_x_continuous(
+    breaks = 0:23
+  ) +
+  scale_color_manual(
+    values = colorRampPalette(RColorBrewer::brewer.pal(9, "Set1"))(12), # Colors for months
+    guide = "none" # Explicitly remove legend
+  ) +
+  labs(
+    title = "Monthly Average Hourly Total Consumption",
+    x = "Hour of Day",
+    y = "Average Consumption (kWh)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+```
+
+## PV Production Profile
+
+Solar generation and capacity factor calculation
+
+```{r}
+
+df_GG_hourly_agg <- df_all %>%
+  filter(Consumption.Category == "GG") %>%  # Select Gross Generation (GG)
+  # Pre-aggregate half-hourly to hourly within each row
+  mutate(
+    H0  = X0.30 + X0.00,
+    H1  = X1.30 + X1.00,
+    H2  = X2.30 + X2.00,
+    H3  = X3.30 + X3.00,
+    H4  = X4.30 + X4.00,
+    H5  = X5.30 + X5.00,
+    H6  = X6.30 + X6.00,
+    H7  = X7.30 + X7.00,
+    H8  = X8.30 + X8.00,
+    H9  = X9.30 + X9.00,
+    H10 = X10.30 + X10.00,
+    H11 = X11.30 + X11.00,
+    H12 = X12.30 + X12.00,
+    H13 = X13.30 + X13.00,
+    H14 = X14.30 + X14.00,
+    H15 = X15.30 + X15.00,
+    H16 = X16.30 + X16.00,
+    H17 = X17.30 + X17.00,
+    H18 = X18.30 + X18.00,
+    H19 = X19.30 + X19.00,
+    H20 = X20.30 + X20.00,
+    H21 = X21.30 + X21.00,
+    H22 = X22.30 + X22.00,
+    H23 = X23.30 + X23.00,
+    date = as.Date(date, format = "%d/%m/%Y"),
+    month = month(date),
+    Season = case_when(
+      month %in% c(11, 12, 1, 2, 3) ~ "Nov-Mar",
+      month %in% c(4, 5) ~ "Apr-May",
+      month %in% c(6, 7, 8) ~ "Jun-Aug",
+      month %in% c(9, 10) ~ "Sep-Oct",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(-starts_with("X")) %>%  # Drop original half-hourly columns
+  pivot_longer(cols = starts_with("H"), names_to = "hr_of_day", values_to = "hourly_kWh",
+               names_prefix = "H", names_transform = list(hr_of_day = as.integer)) %>%
+  group_by(Year, Customer, Generator.Capacity, date, month, hr_of_day, Season) %>%
+  summarize(hourly_kWh = sum(hourly_kWh, na.rm = TRUE), .groups = "drop") %>%  # Aggregate hourly (if needed)
+  group_by(Year, Customer, Generator.Capacity) %>%
+  summarize(agg_output = sum(hourly_kWh, na.rm = TRUE), .groups = "drop") %>%  # Aggregate annual output
+  mutate(cap_factor = agg_output / (Generator.Capacity * 365 * 24))  # Calculate capacity factor
+
+head(df_GG_hourly_agg)
+
+```
+
+### Plot annual output and capacity factor across solar customers
+
+```{r}
+# Annual Solar Output by Year
+plot_agg_output <- ggplot(df_GG_hourly_agg, aes(x = Year, y = agg_output)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(
+    title = "Annual Solar Output by Year",
+    y     = "Annual Output (kWh)"
+  ) +
+  scale_y_continuous(labels = comma) +
+  theme_minimal()
+
+# Capacity Factor by Year
+plot_cap_factor <- ggplot(df_GG_hourly_agg, aes(x = Year, y = cap_factor)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(
+    title = "Capacity Factor by Year",
+    y     = "Capacity Factor"
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal()
+
+# Combine side-by-side
+plot_agg_output + plot_cap_factor
+
+```
+
+## Model 3, 6, 9kW Solar System Output
+
+```{r}
+
+# Generate hourly data and model system sizes in one pipeline
+df_GG_modelled <- df_all %>%
+  filter(Consumption.Category == "GG") %>%
+  mutate(
+    H0  = X0.30 + X0.00, H1  = X1.30 + X1.00, H2  = X2.30 + X2.00, H3  = X3.30 + X3.00,
+    H4  = X4.30 + X4.00, H5  = X5.30 + X5.00, H6  = X6.30 + X6.00, H7  = X7.30 + X7.00,
+    H8  = X8.30 + X8.00, H9  = X9.30 + X9.00, H10 = X10.30 + X10.00, H11 = X11.30 + X11.00,
+    H12 = X12.30 + X12.00, H13 = X13.30 + X13.00, H14 = X14.30 + X14.00, H15 = X15.30 + X15.00,
+    H16 = X16.30 + X16.00, H17 = X17.30 + X17.00, H18 = X18.30 + X18.00, H19 = X19.30 + X19.00,
+    H20 = X20.30 + X20.00, H21 = X21.30 + X21.00, H22 = X22.30 + X22.00, H23 = X23.30 + X23.00,
+    date = as.Date(date, format = "%d/%m/%Y"),
+    month = month(date),
+    Season = case_when(
+      month %in% c(11, 12, 1, 2, 3) ~ "Nov-Mar",
+      month %in% c(4, 5) ~ "Apr-May",
+      month %in% c(6, 7, 8) ~ "Jun-Aug",
+      month %in% c(9, 10) ~ "Sep-Oct",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(-starts_with("X")) %>%
+  pivot_longer(cols = starts_with("H"), names_to = "hr_of_day", values_to = "hourly_kWh",
+               names_prefix = "H", names_transform = list(hr_of_day = as.integer)) %>%
+  group_by(Year, Customer, Generator.Capacity, date, month, hr_of_day, Season) %>%
+  summarize(hourly_kWh = sum(hourly_kWh, na.rm = TRUE), .groups = "drop") %>%
+  mutate(hourly_per_kW = if_else(Generator.Capacity > 0, hourly_kWh / Generator.Capacity, NA_real_)) %>%
+  group_by(Year, Customer, month, hr_of_day, Season) %>%
+  summarize(cust_avg_per_kW = mean(hourly_per_kW, na.rm = TRUE), .groups = "drop") %>%
+  filter(!Customer %in% c(97, 146)) %>%
+  group_by(month, hr_of_day, Season) %>%
+  summarize(avg_output_per_kW = mean(cust_avg_per_kW, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    gen_3kW = avg_output_per_kW * 3,
+    gen_6kW = avg_output_per_kW * 6,
+    gen_9kW = avg_output_per_kW * 9
+  ) %>%
+  pivot_longer(cols = starts_with("gen_"), names_to = "System_Size", values_to = "hourly_kWh") %>%
+  mutate(System_Size = recode(System_Size, "gen_3kW" = "3 kW", "gen_6kW" = "6 kW", "gen_9kW" = "9 kW"))
+
+head(df_GG_modelled)
+```
+
+### Plot modelled solar output
+
+```{r}
+
+# Define common theme for modeling plots
+common_theme <- theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1), panel.grid.minor = element_blank())
+
+# Intermediate hourly data for plotting (before 3-year averaging), restricted to 3 years
+df_GG_hourly_cust <- df_all %>%
+  filter(Consumption.Category == "GG", Year %in% c("2010-11", "2011-12", "2012-13")) %>%
+  mutate(
+    H0  = X0.30 + X0.00, H1  = X1.30 + X1.00, H2  = X2.30 + X2.00, H3  = X3.30 + X3.00,
+    H4  = X4.30 + X4.00, H5  = X5.30 + X5.00, H6  = X6.30 + X6.00, H7  = X7.30 + X7.00,
+    H8  = X8.30 + X8.00, H9  = X9.30 + X9.00, H10 = X10.30 + X10.00, H11 = X11.30 + X11.00,
+    H12 = X12.30 + X12.00, H13 = X13.30 + X13.00, H14 = X14.30 + X14.00, H15 = X15.30 + X15.00,
+    H16 = X16.30 + X16.00, H17 = X17.30 + X17.00, H18 = X18.30 + X18.00, H19 = X19.30 + X19.00,
+    H20 = X20.30 + X20.00, H21 = X21.30 + X21.00, H22 = X22.30 + X22.00, H23 = X23.30 + X23.00,
+    date = as.Date(date, format = "%d/%m/%Y"),
+    month = month(date),
+    Season = case_when(
+      month %in% c(11, 12, 1, 2, 3) ~ "Nov-Mar",
+      month %in% c(4, 5) ~ "Apr-May",
+      month %in% c(6, 7, 8) ~ "Jun-Aug",
+      month %in% c(9, 10) ~ "Sep-Oct",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(-starts_with("X")) %>%
+  pivot_longer(cols = starts_with("H"), names_to = "hr_of_day", values_to = "hourly_kWh",
+               names_prefix = "H", names_transform = list(hr_of_day = as.integer)) %>%
+  group_by(Year, Customer, Generator.Capacity, date, month, hr_of_day, Season) %>%
+  summarize(hourly_kWh = sum(hourly_kWh, na.rm = TRUE), .groups = "drop") %>%
+  mutate(hourly_per_kW = if_else(Generator.Capacity > 0, hourly_kWh / Generator.Capacity, NA_real_)) %>%
+  group_by(Year, Customer, month, hr_of_day, Season) %>%
+  summarize(cust_avg_per_kW = mean(hourly_per_kW, na.rm = TRUE), .groups = "drop") %>%
+  filter(!Customer %in% c(97, 146))
+
+# Plot 1: Normalised PV Generation per kW by Year
+plots_by_year <- map(unique(df_GG_hourly_cust$Year), ~ {
+  df_GG_hourly_cust %>%
+    filter(Year == .x) %>%
+    ggplot(aes(x = hr_of_day, y = cust_avg_per_kW, group = Customer)) +
+    geom_line(alpha = 0.2, color = "blue") +
+    facet_wrap(~ month, nrow = 3, labeller = labeller(month = month.abb)) +
+    scale_x_continuous(breaks = 0:23) +
+    labs(title = paste("Normalised PV Generation per kW by Customer - Year:", .x),
+         x = "Hour of Day", y = "Average kWh per kW") +
+    common_theme
+})
+
+
+# Plot 2: Combined Customer Averages Across All Years
+plot_all_years <- df_GG_hourly_cust %>%
+  group_by(Customer, month, hr_of_day) %>%
+  summarize(cust_avg_per_kW = mean(cust_avg_per_kW, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = hr_of_day, y = cust_avg_per_kW, group = Customer, color = Customer)) +
+  geom_line(size = 0.5, alpha = 0.6) +
+  facet_wrap(~ month, nrow = 3, labeller = labeller(month = month.abb)) +
+  scale_x_continuous(breaks = 0:23) +
+  labs(title = "Normalised PV Generation per kW by Customer (All Years)",
+       x = "Hour of Day", y = "Average kWh per kW") +
+  common_theme +
+  theme(legend.position = "none")
+
+# Plot 3: Modeled Generation Profiles by Month (3, 6, 9 kW Systems)
+plot_modeled <- ggplot(df_GG_modelled, aes(x = hr_of_day, y = hourly_kWh, color = System_Size)) +
+  geom_line(size = 1) +
+  facet_wrap(~ month, nrow = 4, labeller = labeller(month = month.abb)) +
+  scale_x_continuous(breaks = 0:23, labels = sprintf("%02d:00", 0:23)) +
+  labs(title = "Normalised Solar PV Production (3-Year Combined)\nScaled to 3, 6, 9 kW Systems",
+       x = NULL, y = "kWh") +
+  common_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display all plots
+lapply(plots_by_year, print)
+print(plot_all_years)
+print(plot_modeled)
+```
+
+### Overlay Average Consumption with Modelled PV Generation by System Size
+
+```{r}
+
+plot_data <- bind_rows(
+  df_TC_avg_combined %>%
+    filter(Year == "All 3 Years") %>%
+    rename(hourly_kWh = avg_hourly_kWh) %>%
+    mutate(
+      System_Size        = "Consumption",
+      avg_output_per_kW  = NA_real_,
+      month              = factor(month, levels = 1:12, labels = month.abb)
+    ),
+  df_GG_modelled %>%
+    mutate(month = factor(month, levels = 1:12, labels = month.abb))
+)
+
+ggplot(plot_data, aes(x = hr_of_day, y = hourly_kWh, color = System_Size)) +
+  geom_line(size = 1) +
+  facet_wrap(~ month, nrow = 3) +
+  scale_x_continuous(breaks = seq(0, 23, by = 2)) +
+  scale_colour_manual(values = c(
+    "Consumption" = "black",
+    "3 kW"         = "#1f77b4",
+    "6 kW"         = "#ff7f0e",
+    "9 kW"         = "#2ca02c"
+  )) +
+  labs(
+    title = "Monthly Avg Consumption vs. Solar Production",
+    x     = "Hour of Day",
+    y     = "kWh"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.line.x         = element_line(color = "black"),
+    axis.line.y         = element_line(color = "black"),
+    axis.ticks.x        = element_blank(),
+    axis.ticks.y        = element_line(color = "black"),
+    axis.ticks.length.x = unit(-0.1, "cm"),
+    axis.ticks.length.y = unit(-0.1, "cm"),
+    panel.grid.minor    = element_blank(),
+    panel.grid.major.x  = element_line(color = "gray90"),
+    legend.title        = element_blank()
+  )
+```
+
+### Solar Self-Consumption and Export by System Size
+
+```{r}
+#| message: false
+#| warning: false
+
+# Season lookup helper
+season_map <- function(m) case_when(
+  m %in% c(11,12,1,2,3) ~ "Nov-Mar",
+  m %in% c(4,5)         ~ "Apr-May",
+  m %in% c(6,7,8)       ~ "Jun-Aug",
+  m %in% c(9,10)        ~ "Sep-Oct"
+)
+
+# Merge generation with consumption and compute ratios
+df_plot <- df_GG_modelled %>%
+  mutate(Season = season_map(month)) %>%
+  left_join(
+    df_TC_avg_combined %>%
+      filter(Year == "All 3 Years") %>%
+      rename(consumption_kWh = avg_hourly_kWh) %>%
+      mutate(Season = season_map(month)) %>%
+      select(Season, hr_of_day, month, consumption_kWh),
+    by = c("Season","hr_of_day","month")
+  ) %>%
+  mutate(
+    self_consumed_kWh = pmin(consumption_kWh, hourly_kWh, na.rm = TRUE),
+    exported_kWh      = pmax(hourly_kWh - consumption_kWh, 0, na.rm = TRUE),
+    days_in_month     = days_in_month(month),
+    monthly_gen       = hourly_kWh * days_in_month,
+    monthly_self      = self_consumed_kWh * days_in_month,
+    monthly_export    = exported_kWh * days_in_month
+  ) %>%
+  group_by(System_Size, Season) %>%
+  summarise(
+    gen_total  = sum(monthly_gen, na.rm = TRUE),
+    self_total = sum(monthly_self, na.rm = TRUE),
+    exp_total  = sum(monthly_export, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  transmute(
+    System_Size,
+    Season,
+    Self_Consumed = self_total / gen_total * 100,
+    Exported      = exp_total  / gen_total * 100
+  ) %>%
+  pivot_longer(
+    c(Self_Consumed, Exported),
+    names_to = "Category",
+    values_to = "Percentage"
+  ) %>%
+  mutate(
+    Category = factor(Category, levels = c("Self_Consumed", "Exported"))  # Corrected stacking order
+  )
+
+# Split for the two-row layout
+top_data    <- df_plot %>% filter(Season %in% c("Apr-May","Jun-Aug"))
+bottom_data <- df_plot %>% filter(!Season %in% c("Apr-May","Jun-Aug"))
+
+# Common scales & theme
+x_scale    <- scale_x_discrete(expand = c(0,0))
+y_scale    <- scale_y_continuous(expand = c(0,0), sec.axis = dup_axis(name = NULL))
+fill_scale <- scale_fill_manual(
+  values = c("Self_Consumed" = "orange", "Exported" = "maroon"),
+  labels = c("Self-Consumed", "Exported"),
+  name = NULL
+)
+base_theme <- theme_minimal() +
+  theme(
+    panel.grid          = element_blank(),
+    axis.line           = element_line(color = "black"),
+    axis.ticks.x        = element_blank(),
+    axis.ticks.y        = element_line(color = "black"),
+    axis.ticks.length   = unit(0.1, "cm"),
+    axis.text           = element_text(color = "black"),
+    axis.title          = element_text(color = "black"),
+    strip.text          = element_text(color = "black", size = 12),
+    legend.text         = element_text(color = "black"),
+    legend.position     = "right",
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA)
+  )
+
+# Build top and bottom plots
+top_plot <- ggplot(top_data, aes(System_Size, Percentage, fill = Category)) +
+  geom_col() +
+  facet_wrap(~ Season, nrow = 1) +
+  x_scale + y_scale + fill_scale +
+  labs(y = "Percentage (%)", x = "System Size") +
+  base_theme +
+  theme(axis.title.x = element_blank())
+
+bottom_plot <- ggplot(bottom_data, aes(System_Size, Percentage, fill = Category)) +
+  geom_col() +
+  facet_wrap(~ Season, nrow = 1) +
+  x_scale + y_scale + fill_scale +
+  labs(y = "Percentage (%)", x = "System Size") +
+  base_theme +
+  theme(legend.position = "none")
+
+# Combine with shared legend and overall title
+final_plot <- (top_plot / bottom_plot) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Solar Self-Consumption and Export Ratios by Season")
+
+# Save plot to 03-outputs folder
+ggsave(here("03-outputs", "solar_export_ratios.png"), plot = final_plot)
+
+final_plot
+```
+
+### Model Hourly Grid Imports When Solar Is Insufficient by System Size and Season
+
+```{r}
+
+df_grid_import_summary <- df_self_consumption %>%
+  mutate(
+    grid_import_kWh   = pmax(consumption_kWh - hourly_kWh, 0),
+    days_in_month     = days_in_month(month),
+    total_grid_imp    = grid_import_kWh * days_in_month,
+    total_consumption = consumption_kWh  * days_in_month
+  ) %>%
+  group_by(System_Size, Season) %>%
+  summarise(
+    grid_import_pct = sum(total_grid_imp, na.rm = TRUE) /
+                      sum(total_consumption, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Season = factor(Season,
+                    levels = c("Nov-Mar", "Apr-May", "Jun-Aug", "Sep-Oct"))
+  )
+
+
+ggplot(df_grid_import_summary,
+       aes(x = System_Size, y = grid_import_pct, fill = Season)) +
+  geom_col(position = "dodge") +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    limits = c(0, 100),
+    breaks = seq(0, 100, by = 20),
+    expand = c(0, 0)
+  ) +
+  scale_fill_brewer(palette = "Set1", name = NULL) +
+  labs(
+    title = "Grid Import as Percentage of Consumption",
+    x     = "System Size",
+    y     = "Grid Import (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid       = element_blank(),
+    axis.line        = element_line(color = "black"),
+    axis.ticks.y     = element_line(color = "black"),
+    axis.ticks.length= unit(0.2, "cm"),
+    axis.text        = element_text(color = "black"),
+    legend.position  = "right"
+  )
+```
+
+### Seasonal Total Consumption vs. Grid Imports by System Size
+
+```{r}
+#| message: false
+#| warning: false
+
+# Build overlay data
+df_import_overlay <- df_grid_import %>%
+  group_by(Season, hr_of_day, System_Size) %>%
+  summarise(value = mean(grid_import_kWh, na.rm = TRUE), .groups = "drop")
+
+df_consumption_overlay <- df_TC_avg_3yr %>%
+  filter(Year == "All 3 Years") %>%
+  group_by(Season, hr_of_day) %>%
+  summarise(value = mean(avg_hourly_kWh, na.rm = TRUE), .groups = "drop") %>%
+  mutate(System_Size = "Gross Consumption")  # Changed from "Consumption" to "Gross Consumption"
+
+plot_data <- bind_rows(df_consumption_overlay, df_import_overlay)
+
+# Plot with the "monthly" style but facetted by Season
+ggplot(plot_data, aes(x = hr_of_day, y = value, color = System_Size)) +
+  geom_line(size = 1) +
+  facet_wrap(~ Season, nrow = 2) +
+  scale_x_continuous(breaks = seq(0, 23, by = 2)) +
+  scale_colour_manual(values = c(
+    "Gross Consumption" = "black",
+    "3 kW"             = "#1f77b4",
+    "6 kW"             = "#ff7f0e",
+    "9 kW"             = "#2ca02c"
+  )) +
+  labs(
+    title = "Solar Customer Net Load vs. Gross Consumption",
+    x     = "Hour of Day",
+    y     = "kWh"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.line.x         = element_line(color = "black"),
+    axis.line.y         = element_line(color = "black"),
+    axis.ticks.x        = element_blank(),
+    axis.ticks.y        = element_line(color = "black"),
+    axis.ticks.length.x = unit(-0.1, "cm"),
+    axis.ticks.length.y = unit(-0.1, "cm"),
+    panel.grid.minor    = element_blank(),
+    panel.grid.major.x  = element_line(color = "gray90"),
+    legend.title        = element_blank(),
+    plot.background     = element_rect(fill = "white", color = NA),
+    panel.background    = element_rect(fill = "white", color = NA)
+  )
+
+# Save plot to 03-outputs folder
+ggsave(here("03-outputs", "solar_cust_load_profile.png"))
+```
+
+## Export Charge/Reward by System Size (Normal Export Scenario)
+
+```{r}
+month_thresholds <- tibble(
+  Month_Name         = 1:12,
+  Free_Threshold_kWh = c(212,192,212,205,212,205,212,212,205,212,205,212),
+  Days_in_Month      = c(31,28,31,30,31,30,31,31,30,31,30,31),
+  Season             = c("Nov-Mar","Nov-Mar","Nov-Mar","Apr-May","Apr-May",
+                         "Jun-Aug","Jun-Aug","Jun-Aug","Sep-Oct","Sep-Oct",
+                         "Nov-Mar","Nov-Mar")
+)
+
+df_solar_export <- df_self_consumption %>%
+  mutate(
+    Export_Window = case_when(
+      hr_of_day >= 10 & hr_of_day < 15 ~ "Off-Peak",
+      hr_of_day >= 16 & hr_of_day < 21 ~ "Peak",
+      TRUE                              ~ "Shoulder"
+    )
+  )
+
+df_monthly_pv_window <- df_solar_export %>%
+  group_by(System_Size, month, hr_of_day, Export_Window) %>%
+  summarize(
+    monthly_hourly_kWh        = mean(monthly_hourly_kWh,        na.rm = TRUE),
+    monthly_self_consumed_kWh = mean(monthly_self_consumed_kWh, na.rm = TRUE),
+    monthly_exported_kWh      = mean(monthly_exported_kWh,      na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(System_Size, month, Export_Window) %>%
+  summarize(
+    agg_export_kWh         = sum(monthly_exported_kWh,      na.rm = TRUE),
+    agg_generation_kWh     = sum(monthly_hourly_kWh,        na.rm = TRUE),
+    agg_self_consumed_kWh  = sum(monthly_self_consumed_kWh, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_annual_pv_window <- df_monthly_pv_window %>%
+  group_by(System_Size) %>%
+  summarize(
+    agg_generation_kWh     = sum(agg_generation_kWh,     na.rm = TRUE),
+    agg_self_consumed_kWh  = sum(agg_self_consumed_kWh,  na.rm = TRUE),
+    agg_export_kWh         = sum(agg_export_kWh,         na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_monthly_allocated <- df_monthly_pv_window %>%
+  left_join(month_thresholds, by = c("month" = "Month_Name")) %>%
+  mutate(
+    Free_Volume_kWh   = case_when(
+      Export_Window == "Off-Peak" ~ pmin(agg_export_kWh, Free_Threshold_kWh),
+      Export_Window == "Shoulder" ~ agg_export_kWh,
+      TRUE                        ~ 0
+    ),
+    Charge_Volume_kWh = if_else(
+      Export_Window == "Off-Peak",
+      pmax(agg_export_kWh - Free_Threshold_kWh, 0),
+      0
+    ),
+    Reward_Volume_kWh = if_else(Export_Window == "Peak", agg_export_kWh, 0)
+  )
+
+df_monthly_tariff <- df_monthly_allocated %>%
+  group_by(System_Size, month, Season) %>%
+  summarize(
+    monthly_charge_AUD = sum(Charge_Volume_kWh * 0.012, na.rm = TRUE),
+    monthly_reward_AUD = sum(Reward_Volume_kWh * 0.023, na.rm = TRUE),
+    total_free_kWh     = sum(Free_Volume_kWh, na.rm = TRUE),
+    total_charge_kWh   = sum(Charge_Volume_kWh, na.rm = TRUE),
+    total_reward_kWh   = sum(Reward_Volume_kWh, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    monthly_net_AUD = monthly_reward_AUD - monthly_charge_AUD
+  )
+
+df_seasonal_tariff <- df_monthly_tariff %>%
+  group_by(System_Size, Season) %>%
+  summarize(
+    total_charge_AUD = sum(monthly_charge_AUD, na.rm = TRUE),
+    total_reward_AUD = sum(monthly_reward_AUD, na.rm = TRUE),
+    net_AUD          = sum(monthly_net_AUD,      na.rm = TRUE),
+    total_free_kWh   = sum(total_free_kWh,       na.rm = TRUE),
+    total_charge_kWh = sum(total_charge_kWh,     na.rm = TRUE),
+    total_reward_kWh = sum(total_reward_kWh,     na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_annual_tariff <- df_seasonal_tariff %>%
+  group_by(System_Size) %>%
+  summarize(
+    total_charge_AUD = sum(total_charge_AUD, na.rm = TRUE),
+    total_reward_AUD = sum(total_reward_AUD, na.rm = TRUE),
+    net_AUD          = sum(net_AUD,          na.rm = TRUE),
+    total_free_kWh   = sum(total_free_kWh,   na.rm = TRUE),
+    total_charge_kWh = sum(total_charge_kWh, na.rm = TRUE),
+    total_reward_kWh = sum(total_reward_kWh, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    total_export_kWh = total_free_kWh + total_charge_kWh + total_reward_kWh,
+    export_value_4c  = total_export_kWh * 0.04
+  )
+
+ggplot(df_annual_tariff, aes(x = System_Size)) +
+  geom_col(aes(y = total_reward_AUD, fill = "Reward")) +
+  geom_col(aes(y = -total_charge_AUD, fill = "Charge")) +
+  geom_point(aes(y = net_AUD), colour = "black", size = 3) +
+  geom_text(
+    aes(y = net_AUD, label = dollar(round(net_AUD, 0))),
+    vjust = -1, size = 4
+  ) +
+  scale_fill_manual(values = c("Reward" = "forestgreen", "Charge" = "firebrick2")) +
+  labs(
+    title    = "Annual Export Charges & Rewards Under Ausgrid's Two-way Tariffs",
+    subtitle = "By system size",
+    x        = NULL,
+    y        = "Charges / Rewards ($)",
+    fill     = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid        = element_blank(),
+    axis.line         = element_line(colour = "black"),
+    axis.ticks.y      = element_line(colour = "black"),
+    axis.ticks.length = unit(-0.2, "cm"),
+    axis.ticks.x      = element_blank(),
+    axis.text.x       = element_text(colour = "black"),
+    axis.text.y       = element_text(colour = "black"),
+    axis.title        = element_text(colour = "black"),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+ggsave(here("03-outputs", "annual_export_charges_ausgrid_tariffs.png"))
+```
+
+## Retail Usage Rates from Big 3 Retailers
+
+```{r}
+file_usage_rates <- file.path(input_folder, "Usage rates AusGrid.xlsx")
+df_usage_rates <- read_excel(file_usage_rates)
+
+process_rates <- function(df) {
+  df %>%
+    rowwise() %>%
+    mutate(Hours = list(if (Start < End) Start:(End - 1) else c(Start:23, 0:(End - 1)))) %>%
+    unnest(Hours) %>%
+    mutate(Day = if_else(Day == "All", "Weekday/Weekend", Day)) %>%
+    pivot_wider(names_from = Day, values_from = Rate, values_fill = NA) %>%
+    mutate(
+      Weekday = coalesce(Weekday, `Weekday/Weekend`),
+      Weekend = coalesce(Weekend, `Weekday/Weekend`)
+    ) %>%
+    select(-`Weekday/Weekend`) %>%
+    pivot_longer(cols = c("Weekday", "Weekend"), names_to = "Day", values_to = "Rate") %>%
+    group_by(Retailer, Season, Hours, Day) %>%
+    summarise(Rate = mean(Rate, na.rm = TRUE), .groups = "drop")
+}
+
+data_expanded <- process_rates(df_usage_rates)
+average_rates <- data_expanded %>%
+  group_by(Season, Hours, Day) %>%
+  summarise(Average_Rate = mean(Rate, na.rm = TRUE), .groups = "drop")
+
+# split seasons
+top_data    <- average_rates %>% filter(Season %in% c("Apr-May","Jun-Aug"))
+bottom_data <- average_rates %>% filter(!Season %in% c("Apr-May","Jun-Aug"))
+
+# compute y-axis upper limit
+max_rate <- max(average_rates$Average_Rate, na.rm = TRUE)
+upper_y  <- ceiling(max_rate / 10) * 10
+
+# common scales
+x_scale <- scale_x_continuous(
+  breaks = seq(0, 23, by = 2),
+  labels = seq(0, 23, by = 2),
+  expand = c(0, 0)
+)
+y_scale <- scale_y_continuous(
+  name     = "Rate (c/kWh)",
+  breaks   = seq(0, upper_y, by = 10),
+  labels   = function(y) ifelse(y == 0, "", y), 
+  limits   = c(0, upper_y),
+  expand   = c(0, 0),
+  sec.axis = dup_axis()
+)
+lt_scale <- scale_linetype_manual(
+  values = c(Weekday = "solid", Weekend = "dashed"),
+  name   = NULL
+)
+base_theme <- theme_minimal() +
+  theme(
+    panel.grid        = element_blank(),
+    axis.line         = element_line(colour = "black"),
+    axis.ticks        = element_line(colour = "black"),
+    axis.ticks.length = unit(-0.15, "cm"),
+    axis.text         = element_text(colour = "black"),
+    strip.text        = element_text(size = 12)
+  )
+
+# top row (suppress individual legends)
+top_plot <- ggplot(top_data, aes(Hours, Average_Rate, linetype = Day)) +
+  geom_line(size = 1) +
+  facet_wrap(~Season, nrow = 1) +
+  x_scale + y_scale + lt_scale +
+  labs(x = NULL, y = "Rate (c/kWh)") +
+  base_theme +
+  theme(legend.position = "none")
+
+# bottom row
+bottom_plot <- ggplot(bottom_data, aes(Hours, Average_Rate, linetype = Day)) +
+  geom_line(size = 1) +
+  facet_wrap(~Season, nrow = 1) +
+  x_scale + y_scale + lt_scale +
+  labs(x = "Hour of Day", y = NULL) +
+  base_theme +
+  theme(legend.position = "none")
+
+# combine, collect single legend under the subtitle
+combined <- (top_plot / bottom_plot) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Usage Rates for Ausgrid Customers",
+    subtitle = "Average of EnergyAustralia, Origin and AGL (as of Mar-25)"
+  ) &
+  theme(
+    legend.position      = "top",     
+    legend.justification = "center",
+    plot.subtitle        = element_text(margin = margin(b = 2)),
+    plot.margin          = margin(10, 10, 10, 10)
+  )
+
+print(combined)
+```
+
+## Total Bill Savings Under TOU and Single Rate
+
+```{r}
+
+# 1. Data Preparation
+df_fit_info <- tibble(
+  Retailer = c("AGL", "EnergyAustralia", "Origin"),
+  First_FiT_rate = c(0.10, 0.12, 0.10),
+  Second_FiT_rate = c(0.05, 0.076, 0.05),
+  Quarterly_Threshold = c(910, 1365, 1274),
+  Meter_Fee_per_day = c(0.02, 0.06, 0.07)
+)
+
+df_sr_info <- tibble(
+  Retailer = c("AGL", "EnergyAustralia", "Origin"),
+  Single_Rate = c(0.291, 0.335818182, 0.338636364)
+)
+
+# Remove any existing retailer-related columns to avoid duplicates
+df_self_consumption_base <- df_self_consumption %>% 
+  select(-any_of(c("Retailer", "First_FiT_rate", "Second_FiT_rate", 
+                   "Quarterly_Threshold", "Meter_Fee_per_day", "quarter")))
+
+# Cross with df_fit_info and add quarter
+df_self_consumption_with_fit <- df_self_consumption_base %>% 
+  tidyr::crossing(df_fit_info) %>%
+  mutate(quarter = case_when(
+    month %in% 1:3 ~ 1,
+    month %in% 4:6 ~ 2,
+    month %in% 7:9 ~ 3,
+    month %in% 10:12 ~ 4
+  ))
+
+# 2. TOU Self-Consumption Savings
+tou_rate_lookup <- function(hour, retailer, day_type, season) {
+  rate_val <- average_rates %>%
+    filter(Season == season, Hours == hour, Day == day_type) %>%
+    pull(Average_Rate)
+  return(rate_val %||% 0)
+}
+
+df_tou_selfconsumption <- df_self_consumption_with_fit %>%
+  rowwise() %>%
+  mutate(
+    Tou_Weekday_Saving_c = self_consumed_kWh * tou_rate_lookup(hr_of_day, Retailer, "Weekday", Season),
+    Tou_Weekend_Saving_c = self_consumed_kWh * tou_rate_lookup(hr_of_day, Retailer, "Weekend", Season)
+  ) %>%
+  ungroup() %>%
+  group_by(System_Size, Retailer, month) %>%
+  summarize(
+    monthly_tou_saving_AUD = sum(Tou_Weekday_Saving_c * 5 + Tou_Weekend_Saving_c * 2, na.rm = TRUE) / 7 * first(days_in_month) / 100,
+    .groups = "drop"
+  )
+
+# 3. Single Rate Self-Consumption Savings
+df_sr_monthly_sc_savings <- df_self_consumption_with_fit %>%
+  left_join(df_sr_info, by = "Retailer") %>%
+  group_by(System_Size, Retailer, month) %>%
+  summarize(
+    monthly_sr_saving_AUD = sum(self_consumed_kWh * Single_Rate, na.rm = TRUE) * first(days_in_month),
+    .groups = "drop"
+  )
+
+# 4. Export Credits
+df_quarterly_fit_credits <- df_self_consumption_with_fit %>%
+  group_by(System_Size, Retailer, quarter) %>%
+  summarize(quarterly_export_kWh = sum(monthly_exported_kWh, na.rm = TRUE), .groups = "drop") %>%
+  left_join(df_fit_info, by = "Retailer") %>%
+  mutate(
+    quarterly_export_credit_AUD = pmin(quarterly_export_kWh, Quarterly_Threshold) * First_FiT_rate +
+      pmax(quarterly_export_kWh - Quarterly_Threshold, 0) * Second_FiT_rate
+  )
+
+df_monthly_fit_credits <- expand_grid(
+  System_Size = unique(df_quarterly_fit_credits$System_Size),
+  Retailer = unique(df_quarterly_fit_credits$Retailer),
+  month = 1:12
+) %>%
+  mutate(quarter = case_when(
+    month %in% 1:3 ~ 1,
+    month %in% 4:6 ~ 2,
+    month %in% 7:9 ~ 3,
+    month %in% 10:12 ~ 4
+  )) %>%
+  left_join(tibble(month = 1:12, days_in_month = c(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)), by = "month") %>%
+  left_join(
+    df_quarterly_fit_credits %>% select(System_Size, Retailer, quarter, quarterly_export_credit_AUD, Meter_Fee_per_day),
+    by = c("System_Size", "Retailer", "quarter")
+  ) %>%
+  group_by(System_Size, Retailer, quarter) %>%
+  mutate(
+    monthly_export_credit_AUD = quarterly_export_credit_AUD * days_in_month / sum(days_in_month, na.rm = TRUE),
+    monthly_solar_meter_fee_AUD = Meter_Fee_per_day * days_in_month
+  ) %>%
+  ungroup()
+
+# 5. Annual Savings (Pre-Curtailment)
+df_annual_tou_bill_savings <- df_tou_selfconsumption %>%
+  group_by(System_Size, Retailer) %>%
+  summarize(annual_tou_sc_saving_AUD = sum(monthly_tou_saving_AUD, na.rm = TRUE), .groups = "drop") %>%
+  left_join(
+    df_monthly_fit_credits %>%
+      group_by(System_Size, Retailer) %>%
+      summarize(
+        annual_export_credit_AUD = sum(monthly_export_credit_AUD, na.rm = TRUE),
+        annual_meter_fee_AUD = sum(monthly_solar_meter_fee_AUD, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = c("System_Size", "Retailer")
+  ) %>%
+  mutate(annual_tou_bill_saving_AUD = annual_tou_sc_saving_AUD + annual_export_credit_AUD - annual_meter_fee_AUD)
+
+df_annual_sr_bill_savings <- df_sr_monthly_sc_savings %>%
+  group_by(System_Size, Retailer) %>%
+  summarize(annual_sr_sc_saving_AUD = sum(monthly_sr_saving_AUD, na.rm = TRUE), .groups = "drop") %>%
+  left_join(
+    df_monthly_fit_credits %>%
+      group_by(System_Size, Retailer) %>%
+      summarize(
+        annual_export_credit_AUD = sum(monthly_export_credit_AUD, na.rm = TRUE),
+        annual_meter_fee_AUD = sum(monthly_solar_meter_fee_AUD, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = c("System_Size", "Retailer")
+  ) %>%
+  mutate(annual_sr_bill_saving_AUD = annual_sr_sc_saving_AUD + annual_export_credit_AUD - annual_meter_fee_AUD)
+
+df_4c_system_savings <- df_monthly_pv_window %>%
+  group_by(System_Size) %>%
+  summarize(annual_gen_kWh = sum(agg_generation_kWh, na.rm = TRUE), .groups = "drop") %>%
+  mutate(annual_4c_saving_AUD = annual_gen_kWh * 0.04)
+
+df_final_annual_savings <- bind_rows(
+  df_annual_sr_bill_savings %>%
+    group_by(System_Size) %>%
+    summarize(Annual_Saving_AUD = mean(annual_sr_bill_saving_AUD, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Rate_Type = "Single Rate"),
+  df_annual_tou_bill_savings %>%
+    group_by(System_Size) %>%
+    summarize(Annual_Saving_AUD = mean(annual_tou_bill_saving_AUD, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Rate_Type = "TOU"),
+  df_4c_system_savings %>%
+    select(System_Size, Annual_Saving_AUD = annual_4c_saving_AUD) %>%
+    mutate(Rate_Type = "4c System Savings")
+)
+
+# 6. Annual Savings (Post-Curtailment)
+df_monthly_pv_window_with_threshold <- df_monthly_pv_window %>%
+  left_join(month_thresholds %>% select(month = Month_Name, Free_Threshold_kWh), by = "month") %>%
+  mutate(
+    Free_Export_kWh = case_when(
+      Export_Window == "Shoulder" ~ agg_export_kWh,
+      Export_Window == "Off-Peak" ~ pmin(agg_export_kWh, Free_Threshold_kWh),
+      TRUE ~ 0
+    ),
+    Reward_Export_kWh = if_else(Export_Window == "Peak", agg_export_kWh, 0)
+  )
+
+df_annual_export_payoff_with_curtailment <- df_monthly_pv_window_with_threshold %>%
+  group_by(System_Size) %>%
+  summarise(
+    Total_Solar_Use_kWh = sum(agg_self_consumed_kWh, na.rm = TRUE) + sum(Free_Export_kWh, na.rm = TRUE) + sum(Reward_Export_kWh, na.rm = TRUE),
+    Annual_export_AUD = sum(Reward_Export_kWh, na.rm = TRUE) * 0.023,
+    System_savings_AUD = Total_Solar_Use_kWh * 0.04,
+    .groups = "drop"
+  )
+
+df_annual_sr_bill_savings_avg <- df_annual_sr_bill_savings %>%
+  group_by(System_Size) %>%
+  summarise(
+    annual_sr_sc_saving_AUD = mean(annual_sr_sc_saving_AUD, na.rm = TRUE),
+    annual_export_credit_AUD = mean(annual_export_credit_AUD, na.rm = TRUE),
+    annual_meter_fee_AUD = mean(annual_meter_fee_AUD, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    df_annual_export_payoff_with_curtailment %>%
+      select(System_Size, Annual_export_AUD, Total_Solar_Use_kWh, System_savings_AUD),
+    by = "System_Size"
+  ) %>%
+  mutate(annual_sr_bill_saving_AUD_curtail = annual_sr_sc_saving_AUD + Annual_export_AUD - annual_meter_fee_AUD)
+
+df_annual_tou_bill_savings_avg <- df_annual_tou_bill_savings %>%
+  group_by(System_Size) %>%
+  summarise(
+    annual_tou_sc_saving_AUD = mean(annual_tou_sc_saving_AUD, na.rm = TRUE),
+    annual_export_credit_AUD = mean(annual_export_credit_AUD, na.rm = TRUE),
+    annual_meter_fee_AUD = mean(annual_meter_fee_AUD, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    df_annual_export_payoff_with_curtailment %>%
+      select(System_Size, Annual_export_AUD, Total_Solar_Use_kWh, System_savings_AUD),
+    by = "System_Size"
+  ) %>%
+  mutate(annual_tou_bill_saving_AUD_curtail = annual_tou_sc_saving_AUD + Annual_export_AUD - annual_meter_fee_AUD)
+
+df_final_annual_savings_curtail <- bind_rows(
+  df_annual_sr_bill_savings_avg %>%
+    select(System_Size, Annual_Saving_AUD = annual_sr_bill_saving_AUD_curtail) %>%
+    mutate(Rate_Type = "Single Rate"),
+  df_annual_tou_bill_savings_avg %>%
+    select(System_Size, Annual_Saving_AUD = annual_tou_bill_saving_AUD_curtail) %>%
+    mutate(Rate_Type = "TOU"),
+  df_annual_export_payoff_with_curtailment %>%
+    select(System_Size, Annual_Saving_AUD = System_savings_AUD) %>%
+    mutate(Rate_Type = "4c System Savings")
+)
+
+# 7. Savings per kWh
+df_final_annual_savings_per_kWh <- bind_rows(
+  df_annual_sr_bill_savings %>%
+    group_by(System_Size) %>%
+    summarize(Savings_per_kWh = mean(annual_sr_bill_saving_AUD, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Rate_Type = "Single Rate"),
+  df_annual_tou_bill_savings %>%
+    group_by(System_Size) %>%
+    summarize(Savings_per_kWh = mean(annual_tou_bill_saving_AUD, na.rm = TRUE), .groups = "drop") %>%
+    mutate(Rate_Type = "TOU"),
+  df_4c_system_savings %>%
+    select(System_Size, Savings_per_kWh = annual_4c_saving_AUD) %>%
+    mutate(Rate_Type = "4c System Savings")
+) %>%
+  left_join(df_4c_system_savings %>% select(System_Size, annual_gen_kWh), by = "System_Size") %>%
+  mutate(Savings_per_kWh = if_else(annual_gen_kWh > 0 & !is.na(annual_gen_kWh), Savings_per_kWh / annual_gen_kWh, NA_real_))
+
+df_final_savings_per_kwh_curtail <- bind_rows(
+  df_annual_sr_bill_savings_avg %>%
+    transmute(System_Size, Savings_per_kWh = if_else(Total_Solar_Use_kWh > 0 & !is.na(Total_Solar_Use_kWh), annual_sr_bill_saving_AUD_curtail / Total_Solar_Use_kWh, NA_real_), Rate_Type = "Single Rate"),
+  df_annual_tou_bill_savings_avg %>%
+    transmute(System_Size, Savings_per_kWh = if_else(Total_Solar_Use_kWh > 0 & !is.na(Total_Solar_Use_kWh), annual_tou_bill_saving_AUD_curtail / Total_Solar_Use_kWh, NA_real_), Rate_Type = "TOU"),
+  df_annual_export_payoff_with_curtailment %>%
+    transmute(System_Size, Savings_per_kWh = if_else(Total_Solar_Use_kWh > 0 & !is.na(Total_Solar_Use_kWh), System_savings_AUD / Total_Solar_Use_kWh, NA_real_), Rate_Type = "4c System Savings")
+)
+
+```
+
+### Plot Hourly Usage Rates vs. 9kW Export
+
+```{r}
+#| warning: false
+#| message: false
+
+avg_single_rate_c <- mean(df_sr_info$Single_Rate) * 100
+df_tou_rates_long <- average_rates %>% mutate(Rate_Type = "TOU")
+df_single_rates_long <- expand_grid(
+  Season = unique(df_tou_rates_long$Season),
+  Hours = 0:23,
+  Day = c("Weekday", "Weekend")
+) %>% mutate(Average_Rate = avg_single_rate_c, Rate_Type = "Single Rate")
+df_tou_sr_4c_rates <- bind_rows(df_tou_rates_long, df_single_rates_long)
+df_9kW_exports <- df_GG_modelled %>%
+  filter(System_Size == "9 kW") %>%
+  group_by(Season, hr_of_day) %>%
+  summarise(avg_hourly_export_kWh = mean(hourly_kWh, na.rm = TRUE), .groups = "drop")
+df_tou_sr_4c_exports <- df_tou_sr_4c_rates %>%
+  left_join(df_9kW_exports, by = c("Season", "Hours" = "hr_of_day")) %>%
+  mutate(avg_hourly_export_kWh = replace_na(avg_hourly_export_kWh, 0))
+
+# Split into top-row (Apr-May, Jun-Aug) and bottom-row (Sep-Oct, Nov-Mar)
+top_data <- df_tou_sr_4c_exports %>% filter(Season %in% c("Apr-May", "Jun-Aug"))
+bottom_data <- df_tou_sr_4c_exports %>% filter(Season %in% c("Sep-Oct", "Nov-Mar"))
+
+# Compute y-axis limit & export scaling
+max_rate <- max(df_tou_sr_4c_exports$Average_Rate, na.rm = TRUE)
+y_upper <- ceiling(max_rate / 20) * 20
+max_export <- max(df_tou_sr_4c_exports$avg_hourly_export_kWh, na.rm = TRUE)
+export_scale_fac <- if (max_export > 0) max_rate / max_export else 1
+
+# Common scales & legend settings
+x_scale <- scale_x_continuous(breaks = seq(0, 23, by = 2), expand = c(0, 0))
+y_scale <- scale_y_continuous(
+  name = "Usage Rate (c/kWh)",
+  breaks = seq(0, y_upper, by = 20),
+  limits = c(0, y_upper),
+  expand = c(0, 0),
+  sec.axis = sec_axis(~ . / export_scale_fac, name = "Export (kWh)")
+)
+colour_scale <- scale_colour_manual(
+  name = NULL,
+  values = c("TOU" = "blue", "Single Rate" = "red")
+)
+fill_scale <- scale_fill_manual(
+  name = NULL,
+  values = c("9 kW Export" = "goldenrod")
+)
+lt_scale <- scale_linetype_manual(
+  values = c(Weekday = "solid", Weekend = "dashed"),
+  guide = "none"  
+)
+
+base_theme <- theme_minimal(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(colour = "black"),
+    axis.ticks = element_line(colour = "black"),
+    axis.ticks.length = unit(-0.15, "cm"),
+    axis.text = element_text(colour = "black"),
+    axis.title = element_text(colour = "black"),
+    strip.text = element_text(face = "bold")
+  )
+
+# Prepare annotation data for the Apr-May facet only
+ann <- tibble(
+  Season = "Apr-May",
+  Hours = c(16.5, 17),
+  y = c(40, 27),
+  label = c("Weekday", "Weekend")
+)
+
+# Top-row plot with annotations in the Apr-May facet
+top_plot <- ggplot(top_data, aes(x = Hours)) +
+  geom_area(aes(y = avg_hourly_export_kWh * export_scale_fac, fill = "9 kW Export"), alpha = 0.4) +
+  geom_line(aes(y = Average_Rate, colour = Rate_Type, linetype = Day), size = 1) +
+  geom_text(
+    data = ann,
+    aes(x = Hours, y = y, label = label),
+    colour = "blue",
+    size = 4,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ Season, nrow = 1) +
+  x_scale + y_scale + colour_scale + fill_scale + lt_scale +
+  labs(x = NULL, y = "Usage Rate (c/kWh)") +
+  base_theme
+
+# Bottom-row plot (no annotation)
+bottom_plot <- ggplot(bottom_data, aes(x = Hours)) +
+  geom_area(aes(y = avg_hourly_export_kWh * export_scale_fac, fill = "9 kW Export"), alpha = 0.4) +
+  geom_line(aes(y = Average_Rate, colour = Rate_Type, linetype = Day), size = 1) +
+  facet_wrap(~ Season, nrow = 1) +
+  x_scale + y_scale + colour_scale + fill_scale + lt_scale +
+  labs(x = "Hour of Day", y = NULL) +
+  base_theme
+
+# Combine with shared legend, left-aligned title, goldenrod on secondary axis
+(top_plot / bottom_plot) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Hourly Usage Rates vs 9 kW Solar Export",
+    subtitle = "By season and tariff type"
+  ) &
+  theme(
+    legend.position = "top",
+    legend.justification = "center",
+    plot.title = element_text(hjust = 0, face = "bold"),
+    plot.subtitle = element_text(margin = margin(b = 5)),
+    axis.text.y.right = element_text(colour = "goldenrod"),
+    axis.title.y.right = element_text(colour = "goldenrod"),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+ggsave(here("03-outputs", "hourly_usage_vs_9kw_export.png"), width= 20, height = 17.5, units = "cm")
+```
+
+### Annual bill savings before & after curtailment
+
+```{r}
+#| message: false
+#| warning: false
+
+# Plot 1: Stacked Column Chart of Annual Bill Savings (Pre-Curtailment)
+df_stacked_savings <- df_final_annual_savings %>%
+  group_by(System_Size) %>%
+  mutate(
+    System_Savings = Annual_Saving_AUD[Rate_Type == "4c System Savings"],
+    Excess_Savings = if_else(Rate_Type != "4c System Savings", Annual_Saving_AUD - System_Savings, NA_real_)
+  ) %>%
+  filter(Rate_Type != "4c System Savings") %>%
+  pivot_longer(cols = c(System_Savings, Excess_Savings), names_to = "Savings_Type", values_to = "Value") %>%
+  mutate(
+    Savings_Type = factor(Savings_Type, levels = c("System_Savings", "Excess_Savings")),
+    Rate_Type = recode(Rate_Type, "Single Rate" = "Single Rate", "TOU" = "Time-of-Use")
+  ) %>%
+  arrange(System_Size, Rate_Type, desc(Savings_Type))
+
+ggplot(df_stacked_savings, aes(x = System_Size, y = Value, fill = forcats::fct_relevel(Savings_Type, "Excess_Savings", "System_Savings"))) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = paste0("$", round(Value, 0))), position = position_stack(vjust = 0.5), color = "white", size = 5, fontface = "bold") +
+  facet_wrap(~ Rate_Type, labeller = as_labeller(c("Single Rate" = "Single Rate", "Time-of-Use" = "Time-of-Use"))) +
+  scale_fill_manual(
+    values = c("System_Savings" = "#00897B", "Excess_Savings" = "#FF6F61"),
+    labels = c("System_Savings" = "System Savings (4c/kWh)", "Excess_Savings" = "Excess Bill Savings")
+  ) +
+  scale_y_continuous(
+    limits = c(0, 2000),
+    breaks = seq(0, 2000, by = 500),
+    labels = scales::dollar_format(prefix = "$", big.mark = ","),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(title = "Ausgrid Solar Customer Annual Bill Savings\n(Before Export Charges)", x = "System Size", y = "Annual Savings ($)", fill = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, colour = "black", size = 15),
+    axis.text.y = element_text(colour = "black", size = 15),
+    plot.title = element_text(hjust = 0, size = 18, face = "bold"),
+    axis.line.x = element_line(color = "black"),
+    axis.line.y = element_line(color = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.length.y = unit(-0.2, "cm"),
+    legend.position = "top",
+    legend.text = element_text(size = 12),
+    legend.margin = margin(t = 15, b = 15),
+    strip.text = element_text(size = 18, face = "bold"),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+ggsave(here("03-outputs", "annual_bill_savings_pre_curtailment.png"))
+
+# Plot 2: Stacked Column Chart of Annual Bill Savings (Post-Curtailment)
+df_stacked_savings_annual_curtail <- df_final_annual_savings_curtail %>%
+  group_by(System_Size) %>%
+  mutate(
+    System_Savings_AUD = Annual_Saving_AUD[Rate_Type == "4c System Savings"],
+    Excess_Savings_AUD = if_else(Rate_Type != "4c System Savings", Annual_Saving_AUD - System_Savings_AUD, NA_real_)
+  ) %>%
+  filter(Rate_Type != "4c System Savings") %>%
+  pivot_longer(cols = c(System_Savings_AUD, Excess_Savings_AUD), names_to = "Savings_Type", values_to = "Value") %>%
+  mutate(
+    Savings_Type = factor(Savings_Type, levels = c("System_Savings_AUD", "Excess_Savings_AUD")),
+    Rate_Type = recode(Rate_Type, "Single Rate" = "Single Rate", "TOU" = "Time-of-Use")
+  ) %>%
+  arrange(System_Size, Rate_Type, desc(Savings_Type))
+
+ggplot(df_stacked_savings_annual_curtail, aes(x = System_Size, y = Value, fill = forcats::fct_relevel(Savings_Type, "Excess_Savings_AUD", "System_Savings_AUD"))) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = paste0("$", round(Value, 0))), position = position_stack(vjust = 0.5), color = "white", size = 5, fontface = "bold") +
+  facet_wrap(~ Rate_Type, labeller = as_labeller(c("Single Rate" = "Single Rate", "Time-of-Use" = "Time-of-Use"))) +
+  scale_fill_manual(
+    values = c("System_Savings_AUD" = "#00897B", "Excess_Savings_AUD" = "#FF6F61"),
+    labels = c("System_Savings_AUD" = "System Savings (4c/kWh)", "Excess_Savings_AUD" = "Excess Bill Savings")
+  ) +
+  scale_y_continuous(
+    limits = c(0, 2000),
+    breaks = seq(0, 2000, by = 500),
+    labels = scales::dollar_format(prefix = "$", big.mark = ","),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    title = "Ausgrid Solar Customer Annual Bill Savings\n(After Export Charges)", 
+    x = "System Size", 
+    y = "Annual Savings ($)", 
+    fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, colour = "black", size = 15),
+    axis.text.y = element_text(colour = "black", size = 15),
+    plot.title = element_text(hjust = 0, size = 18, face = "bold"),
+    axis.line.x = element_line(color = "black"),
+    axis.line.y = element_line(color = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.y = element_line(color = "black"),
+    axis.ticks.length.y = unit(-0.2, "cm"),
+    legend.position = "top",
+    legend.text = element_text(size = 12),
+    legend.margin = margin(t = 15, b = 15),
+    strip.text = element_text(size = 18, face = "bold"),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+ggsave(here("03-outputs","annual_bill_savings_post_curtailment.png"))
+```
+
+## Decompose bill savings - FiT vs Self-Consmp
+
+```{r}
+
+# For Single Rate: use df_annual_sr_bill_savings_avg
+comp_pre_sr <- df_annual_sr_bill_savings_avg %>%
+  mutate(
+    SC          = annual_sr_sc_saving_AUD,         # Self-consumption savings
+    Export      = annual_export_credit_AUD,         # Full export credit (FiT)
+    MeterFee    = -annual_meter_fee_AUD,            # Negative meter fee
+    Curtailment = "Pre-Curtailment",
+    Rate_Type   = "Single Rate"
+  ) %>%
+  select(System_Size, Rate_Type, Curtailment, SC, Export, MeterFee)
+
+# For Time-of-Use: use df_annual_tou_bill_savings_avg
+comp_pre_tou <- df_annual_tou_bill_savings_avg %>%
+  mutate(
+    SC          = annual_tou_sc_saving_AUD,
+    Export      = annual_export_credit_AUD,
+    MeterFee    = -annual_meter_fee_AUD,
+    Curtailment = "Pre-Curtailment",
+    Rate_Type   = "Time-of-Use"
+  ) %>%
+  select(System_Size, Rate_Type, Curtailment, SC, Export, MeterFee)
+
+comp_pre <- bind_rows(comp_pre_sr, comp_pre_tou)
+
+# For post-curtailment (Two-Way Export Pricing)
+comp_post_sr <- df_annual_sr_bill_savings_avg %>%
+  mutate(
+    SC          = annual_sr_sc_saving_AUD,
+    Export      = Annual_export_AUD,                # Reduced export credit
+    MeterFee    = -annual_meter_fee_AUD,
+    Curtailment = "Post-Curtailment",
+    Rate_Type   = "Single Rate"
+  ) %>%
+  select(System_Size, Rate_Type, Curtailment, SC, Export, MeterFee)
+
+comp_post_tou <- df_annual_tou_bill_savings_avg %>%
+  mutate(
+    SC          = annual_tou_sc_saving_AUD,
+    Export      = Annual_export_AUD,
+    MeterFee    = -annual_meter_fee_AUD,
+    Curtailment = "Post-Curtailment",
+    Rate_Type   = "Time-of-Use"
+  ) %>%
+  select(System_Size, Rate_Type, Curtailment, SC, Export, MeterFee)
+
+comp_post <- bind_rows(comp_post_sr, comp_post_tou)
+
+# Combine pre and post data and pivot
+comp_all <- bind_rows(comp_pre, comp_post)
+
+comp_long <- comp_all %>%
+  pivot_longer(cols = c(SC, Export, MeterFee),
+               names_to = "Component",
+               values_to = "Value") %>%
+  mutate(
+    Component   = factor(Component, levels = c("Export", "SC", "MeterFee")),
+    Rate_Type   = factor(Rate_Type, levels = c("Single Rate", "Time-of-Use")),
+    Curtailment = factor(Curtailment, levels = c("Pre-Curtailment", "Post-Curtailment")),
+    Value       = round(Value)
+  )
+
+# Define custom labels
+comp_labels <- c(
+  Export = "Feed-in tariffs",
+  SC = "Self-consumption",
+  MeterFee = "Solar meter fee"
+)
+
+# Colour mapping
+fill_colors <- c(
+  "SC" = "#7570b3",
+  "Export" = "#1b9e77",
+  "MeterFee" = "#d95f02"
+)
+
+# Determine shared y-axis range across both plots
+ymax <- comp_all %>%
+  mutate(Total = SC + Export + MeterFee) %>%
+  summarise(max_total = max(Total, na.rm = TRUE)) %>%
+  pull(max_total) %>%
+  ceiling() 
+
+ymin <- floor(min(comp_long %>% pull(Value), na.rm = TRUE) / 50) * 50
+
+# --- Plot for Single Rate ---
+p_sr <- comp_long %>%
+  filter(Rate_Type == "Single Rate") %>%
+  ggplot(aes(x = System_Size, y = Value, fill = Component)) +
+  geom_col(position = "stack", color = NA) +
+  geom_text(aes(label = dollar(Value)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 5, fontface = "bold") +
+  facet_wrap(~Curtailment, nrow = 1) +
+  scale_fill_manual(values = fill_colors, labels = comp_labels) +
+  labs(title = "Single Rate: Annual Bill Savings Composition",
+       x = "System Size", y = "Bill Savings (AUD)", fill = NULL) +
+  coord_cartesian(ylim = c(ymin, ymax)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.text.x = element_text(hjust = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+# --- Plot for Time-of-Use ---
+p_tou <- comp_long %>%
+  filter(Rate_Type == "Time-of-Use") %>%
+  ggplot(aes(x = System_Size, y = Value, fill = Component)) +
+  geom_col(position = "stack", color = NA) +
+  geom_text(aes(label = dollar(Value)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 5, fontface = "bold") +
+  facet_wrap(~Curtailment, nrow = 1) +
+  scale_fill_manual(values = fill_colors, labels = comp_labels) +
+  labs(title = "Time-of-Use: Annual Bill Savings Composition",
+       x = "System Size", y = "Bill Savings (AUD)", fill = NULL) +
+  coord_cartesian(ylim = c(ymin, ymax)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.text.x = element_text(hjust = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+# --- Show Plots ---
+print(p_sr)
+print(p_tou)
+
+ggsave(here("03-outputs", "single_rate_bill_savings_composition.png"), plot = p_sr)
+ggsave(here("03-outputs", "tou_bill_savings_composition.png"), plot = p_tou)
+```
+
+## Network usage savings
+
+```{r}
+
+# Add TOU rates to df_self_consumption
+get_tou_rate <- function(month, hr_of_day) {
+  peak_months <- c(1, 2, 3, 6, 7, 8, 11, 12)
+  peak_hours <- 15:20
+  if (month %in% peak_months & hr_of_day %in% peak_hours) 26.8969 else 4.6503
+}
+
+df_self_consumption <- df_self_consumption %>%
+  rowwise() %>%
+  mutate(tou_rate = get_tou_rate(month, hr_of_day)) %>%
+  ungroup()
+
+# Pre-solar charges
+df_pre_solar <- df_self_consumption %>%
+  select(month, hr_of_day, consumption_kWh, days_in_month, tou_rate) %>%
+  distinct()
+
+annual_pre_solar_sr <- df_pre_solar %>%
+  summarise(total_charge = sum(consumption_kWh * days_in_month * (10.8007 / 100))) %>%
+  pull(total_charge)
+
+annual_pre_solar_tou <- df_pre_solar %>%
+  summarise(total_charge = sum(consumption_kWh * days_in_month * (tou_rate / 100))) %>%
+  pull(total_charge)
+
+# Post-solar charges
+df_post_solar_sr <- df_self_consumption %>%
+  select(System_Size, month, hr_of_day, consumption_kWh, hourly_kWh, days_in_month) %>%
+  distinct() %>%
+  group_by(System_Size) %>%
+  summarise(annual_post_solar_sr = sum(pmax(consumption_kWh - hourly_kWh, 0) * days_in_month * (10.8007 / 100)))
+
+df_post_solar_tou <- df_self_consumption %>%
+  select(System_Size, month, hr_of_day, consumption_kWh, hourly_kWh, days_in_month, tou_rate) %>%
+  distinct() %>%
+  group_by(System_Size) %>%
+  summarise(annual_post_solar_tou = sum(pmax(consumption_kWh - hourly_kWh, 0) * days_in_month * (tou_rate / 100)))
+
+# Savings
+df_savings <- df_post_solar_sr %>%
+  left_join(df_post_solar_tou, by = "System_Size") %>%
+  mutate(
+    savings_sr = annual_pre_solar_sr - annual_post_solar_sr,
+    savings_tou = annual_pre_solar_tou - annual_post_solar_tou
+  )
+
+# Data for charges plot
+df_charges <- tibble(
+  System_Size = c("Pre-Solar", "Pre-Solar", "3 kW", "6 kW", "9 kW", "3 kW", "6 kW", "9 kW"),
+  Tariff = c("Single Rate", "TOU", "Single Rate", "Single Rate", "Single Rate", "TOU", "TOU", "TOU"),
+  Annual_Charge = c(
+    annual_pre_solar_sr,
+    annual_pre_solar_tou,
+    df_post_solar_sr$annual_post_solar_sr[1],
+    df_post_solar_sr$annual_post_solar_sr[2],
+    df_post_solar_sr$annual_post_solar_sr[3],
+    df_post_solar_tou$annual_post_solar_tou[1],
+    df_post_solar_tou$annual_post_solar_tou[2],
+    df_post_solar_tou$annual_post_solar_tou[3]
+  )
+)
+
+# Data for savings
+df_savings_plot <- df_savings %>%
+  select(System_Size, savings_sr, savings_tou) %>%
+  pivot_longer(cols = c(savings_sr, savings_tou), names_to = "Tariff", values_to = "Savings") %>%
+  mutate(Tariff = recode(Tariff, "savings_sr" = "Single Rate", "savings_tou" = "TOU"))
+
+# Order System_Size
+df_charges <- df_charges %>%
+  mutate(System_Size = factor(System_Size, levels = c("Pre-Solar", "3 kW", "6 kW", "9 kW")))
+
+# Savings ranges
+sr_savings <- df_savings_plot %>%
+  filter(Tariff == "Single Rate") %>%
+  summarise(
+    min_saving = min(Savings, na.rm = TRUE),
+    max_saving = max(Savings, na.rm = TRUE)
+  ) %>%
+  mutate(range = paste0("Solar network usage savings: $", round(min_saving, 0), " to $", round(max_saving, 0))) %>%
+  pull(range)
+
+tou_savings <- df_savings_plot %>%
+  filter(Tariff == "TOU") %>%
+  summarise(
+    min_saving = min(Savings, na.rm = TRUE),
+    max_saving = max(Savings, na.rm = TRUE)
+  ) %>%
+  mutate(range = paste0("Solar network usage savings: $", round(min_saving, 0), " to $", round(max_saving, 0))) %>%
+  pull(range)
+
+# Single Rate plot
+p_sr <- df_charges %>%
+  filter(Tariff == "Single Rate") %>%
+  ggplot(aes(x = System_Size, y = Annual_Charge)) +
+  geom_bar(stat = "identity", fill = "#d95f02") +
+  geom_text(
+    aes(label = scales::dollar(round(Annual_Charge, 0))),
+    vjust = -0.5,
+    size = 3.5,
+    color = "black"
+  ) +
+  labs(
+    title = "Annual Network Usage Charges - Single Rate",
+    subtitle = sr_savings,
+    x = "System Size",
+    y = "Usage Charge ($)"
+  ) +
+  scale_y_continuous(labels = scales::dollar_format(), expand = c(0,0)) +
+  coord_cartesian(ylim = c(0, 800)) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.ticks.length.y = unit(-0.15, "cm"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "black"),
+    plot.subtitle = element_text(color = "black", margin = margin(b = 10)),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+# TOU plot
+p_tou <- df_charges %>%
+  filter(Tariff == "TOU") %>%
+  ggplot(aes(x = System_Size, y = Annual_Charge)) +
+  geom_bar(stat = "identity", fill = "#1b9e77") +
+  geom_text(
+    aes(label = scales::dollar(round(Annual_Charge, 0))),
+    vjust = -0.5,
+    size = 3.5,
+    color = "black"
+  ) +
+  labs(
+    title = "Annual Network Usage Charges - Time of Use",
+    subtitle = tou_savings,
+    x = "System Size",
+    y = "Usage Charge ($)"
+  ) +
+  scale_y_continuous(labels = scales::dollar_format(), expand = c(0,0)) +
+  coord_cartesian(ylim = c(0, 800)) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.ticks.length.y = unit(-0.15, "cm"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "black"),
+    plot.subtitle = element_text(color = "black", margin = margin(b = 10)),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+
+# Save plots
+ggsave(here("03-outputs", "network_usage_charges_single_rate.png"), plot = p_sr)
+ggsave(here("03-outputs", "network_usage_charges_tou.png"), plot = p_tou)
+
+# Print plots
+print(p_sr)
+print(p_tou)
+```
