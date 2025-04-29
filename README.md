@@ -12,54 +12,59 @@ Rooftop PV has been promoted as a doubly virtuous solution to lower household bi
 ---
 ## 1 · Cost & adoption trends
 
-| | |
-|---|---|
-| ![PV system price](03-outputs/rooftop_pv_system_price.png) | **Module prices keep falling** — down >80 % since 2010. |
-| ![Install size](03-outputs/rooftop_pv_installation_size_state.png) | **Mass uptake post‑2010** plus steadily larger systems. |
-| ![NSW typical cost](03-outputs/rooftop_pv_typical_cost_size_nsw.png) | **Typical NSW install** shows capital outlay tracks both price and system size. |
+**Cost of rooftop solar declined dramatically from early 2000s**
+![PV system price](03-outputs/rooftop_pv_system_price.png)
+
+**Mass uptake post‑2010 with steadily larger system sizes**
+![Install size](03-outputs/rooftop_pv_installation_size_state.png)
+
+**During the mass adoption phase (post-2010) households have purchased the largest possible system size that costed no more than $10k**
+![NSW typical cost](03-outputs/rooftop_pv_typical_cost_size_nsw.png)
+
 
 ---
 ## 2 · High financial returns drive uptake
 
+**Commonwealth rebates front‑loaded the early boom.**
 ![Rebate history](03-outputs/rooftop_solar_rebates_history.png)
-*Commonwealth rebates front‑loaded the early boom.*
 
+**Australian households were significantly subsidised to take up rooftop solar.**
 ![Rebate vs pocket](03-outputs/solar_rebate_vs_pocket.png)
-*Australian households were significantly subsidised to take up rooftop solar.*
 
+**At it's peak the Solar Bonus Scheme offered NSW residents 6x the subsequent market feed-in tariff rates**
 ![FiT NSW](03-outputs/fit_nsw_history.png)
-*At it's peak the Solar Bonus Scheme offered NSW residents 6x the subsequent market feed-in tariff rates*
 
+**Compelling historical financial returns from rooftop solar drove mass adoption**
 ![Returns](03-outputs/rooftop_pv_fincial_return.png)
-*Compelling historical financial returns from rooftop solar drove mass adoption*
 
 ---
 ## 3 · Actual value to the grid
 
+**Displacing 24.5 TWh of coal & gas avoided **≈ $1 bn**, equal to **~4 ¢ / kWh** of rooftop output.**
 ![Fuel & opex saving](03-outputs/fuel_opex_savings_rooftop_pv.png)
-*Displacing 24.5 TWh of coal & gas avoided **≈ $1 bn**, equal to **~4 ¢ / kWh** of rooftop output.*
 
 ---
 ## 4 · Outsized bill savings across the NEM
 
+**Median solar customer bill savings by DNSP (Jul‑24).**
 ![DNSP savings](03-outputs/solar_bill_savings_kwh_output_dnsps.png)
-*Median solar customer bill savings by DNSP (Jul‑24).*  
 
+**Customer‑weighted state averages.**
 ![State savings](03-outputs/solar_bill_savings_kwh_output_state.png)
-*Customer‑weighted state averages.*
 
 > Single‑rate customers save 9–18 ¢ / kWh; TOU 8–16 ¢ / kWh — **well above** the 4 ¢ / kWh system benefit.
 
 ---
 ## 5 · Ausgrid two‑way export tariffs
 
+**Average seasonal load vs PV output in the Ausgrid solar customer sample.**
 ![Load profile](03-outputs/solar_cust_load_profile.png)
-*Average seasonal load vs PV output underpinning the Ausgrid model.*
 
+**Net export charge reaches at **$29 / yr** for a 9 kW system if households do not curtail.**
 ![Export charges](03-outputs/annual_export_charges_ausgrid_tariffs.png)
-*Net export charge reaches at **$29 / yr** for a 9 kW system if households do not curtail.*
 
-Annual bill savings before and after Ausgrid's two-way export tariffs (assuming households curtail export to avoid any export charges):
+
+### Annual bill savings before and after Ausgrid's two-way export tariffs (assuming households curtail export to avoid any export charges):
 
 **Before tariffs**  |  **After tariffs**
 :--:|:--:
@@ -76,13 +81,6 @@ Annual bill savings before and after Ausgrid's two-way export tariffs (assuming 
 | ![SR network](03-outputs/network_usage_charges_single_rate.png) | ![TOU network](03-outputs/network_usage_charges_tou.png) |
 
 Solar households sidestep **$200–282 / yr** in DUoS charges; networks must recover this from a smaller delivered‑energy base.
-
----
-## Caveats & assumptions
-* Analysis covers mainland NEM states + ACT; WA & NT excluded.
-* Fuel‑opex saving assumes uniform merit‑order displacement (coal → CCGT → OCGT) and ignores system‑level integration costs.
-* TOU self‑consumption valued at the **shoulder** rate — conservative for PV‑aligned peak periods.
-* Ausgrid case study uses 2010‑13 smart‑meter data; behavioural drift and battery uptake may alter future outcomes.
 
 ---
 ## Repository map
